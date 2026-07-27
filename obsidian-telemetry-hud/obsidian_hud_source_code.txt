@@ -1,0 +1,2807 @@
+================================================================================
+OBSIDIAN TELEMETRY HUD - TÜM KAYNAK KODLARI
+================================================================================
+
+
+// Dosya Yolu: package.json
+================================================================================
+{
+  "name": "react-example",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port=3000 --host=0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview",
+    "clean": "rm -rf dist server.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@google/genai": "^2.4.0",
+    "@tailwindcss/vite": "^4.1.14",
+    "@vitejs/plugin-react": "^5.0.4",
+    "lucide-react": "^0.546.0",
+    "react": "^19.0.1",
+    "react-dom": "^19.0.1",
+    "vite": "^6.2.3",
+    "express": "^4.21.2",
+    "dotenv": "^17.2.3",
+    "motion": "^12.23.24"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "autoprefixer": "^10.4.21",
+    "esbuild": "^0.25.0",
+    "tailwindcss": "^4.1.14",
+    "tsx": "^4.21.0",
+    "typescript": "~5.8.2",
+    "vite": "^6.2.3",
+    "@types/express": "^4.17.21"
+  }
+}
+
+================================================================================
+
+
+// Dosya Yolu: vite.config.ts
+================================================================================
+import tailwindcss from '@tailwindcss/vite';
+import react from '@vitejs/plugin-react';
+import path from 'path';
+import {defineConfig} from 'vite';
+
+export default defineConfig(() => {
+  return {
+    plugins: [react(), tailwindcss()],
+    resolve: {
+      alias: {
+        '@': path.resolve(__dirname, '.'),
+      },
+    },
+    server: {
+      // HMR is disabled in AI Studio via DISABLE_HMR env var.
+      // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
+      hmr: process.env.DISABLE_HMR !== 'true',
+      // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
+      watch: process.env.DISABLE_HMR === 'true' ? null : {},
+    },
+  };
+});
+
+================================================================================
+
+
+// Dosya Yolu: tsconfig.json
+================================================================================
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "experimentalDecorators": true,
+    "useDefineForClassFields": false,
+    "module": "ESNext",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "isolatedModules": true,
+    "moduleDetection": "force",
+    "allowJs": true,
+    "jsx": "react-jsx",
+    "paths": {
+      "@/*": [
+        "./*"
+      ]
+    },
+    "allowImportingTsExtensions": true,
+    "noEmit": true
+  }
+}
+
+================================================================================
+
+
+// Dosya Yolu: cs2_telemetry_server.py
+================================================================================
+import os
+import sys
+import json
+import time
+import math
+import socket
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+# Try importing pymem
+try:
+    import pymem
+    import pymem.process
+except ImportError:
+    print("WARNING: 'pymem' library not found. Running in mock telemetry mode.")
+    print("To read real CS2 memory, please run: pip install pymem Flask flask-cors")
+    pymem = None
+
+app = Flask(__name__)
+CORS(app)
+
+DUMPER_PATH = r"C:\Users\crazy\Downloads\cs2-dumper-main\cs2-dumper-main\output"
+OFFSETS_FILE = os.path.join(DUMPER_PATH, "offsets.json")
+CLIENT_DLL_FILE = os.path.join(DUMPER_PATH, "client_dll.json")
+
+# Default offsets
+offsets = {
+    "dwLocalPlayerPawn": 0x1651B60,
+    "dwLocalPlayerController": 0x162A480,
+    "dwEntityList": 0x254F2D0,
+    "dwViewMatrix": 0x165B880
+}
+
+fields = {
+    "m_iHealth": 0x32C,
+    "m_iTeamNum": 0x3BF,
+    "m_vOldOrigin": 0x127C,
+    "m_hPlayerPawn": 0x7E4,
+    "m_sSanitizedPlayerName": 0x740
+}
+
+# Try loading from cs2-dumper output
+if os.path.exists(OFFSETS_FILE) and os.path.exists(CLIENT_DLL_FILE):
+    try:
+        with open(OFFSETS_FILE, "r") as f:
+            offset_data = json.load(f)
+            client_offsets = offset_data.get("client.dll", {})
+            for k in offsets.keys():
+                if k in client_offsets:
+                    offsets[k] = client_offsets[k]
+                    
+        with open(CLIENT_DLL_FILE, "r") as f:
+            dll_data = json.load(f)
+            classes = dll_data.get("client.dll", {}).get("classes", {})
+            
+            def extract_field(class_name, field_name, key):
+                if class_name in classes:
+                    field_val = classes[class_name].get("fields", {}).get(field_name)
+                    if field_val is not None:
+                        fields[key] = field_val
+
+            extract_field("C_BaseEntity", "m_iHealth", "m_iHealth")
+            extract_field("C_BaseEntity", "m_iTeamNum", "m_iTeamNum")
+            extract_field("C_BasePlayerPawn", "m_vOldOrigin", "m_vOldOrigin")
+            extract_field("CCSPlayerController", "m_hPlayerPawn", "m_hPlayerPawn")
+            extract_field("CBasePlayerController", "m_sSanitizedPlayerName", "m_sSanitizedPlayerName")
+            
+        print("Offsets successfully loaded from cs2-dumper output.")
+    except Exception as e:
+        print(f"Error parsing dumper files, using built-in offsets: {e}")
+else:
+    print("Dumper output files not found at path, using default offsets.")
+
+# Pymem process handlers
+pm = None
+client_base = 0
+
+def connect_cs2():
+    global pm, client_base
+    if pymem is None:
+        return False
+    try:
+        pm = pymem.Pymem("cs2.exe")
+        client = pymem.process.module_from_name(pm.process_handle, "client.dll")
+        if client:
+            client_base = client.lpBaseOfDll
+            return True
+    except Exception:
+        pass
+    return False
+
+# Math projection: 3D to 2D Screen
+def world_to_screen(pos, matrix, width, height):
+    clip_x = pos[0] * matrix[0] + pos[1] * matrix[1] + pos[2] * matrix[2] + matrix[3]
+    clip_y = pos[0] * matrix[4] + pos[1] * matrix[5] + pos[2] * matrix[6] + matrix[7]
+    clip_z = pos[0] * matrix[8] + pos[1] * matrix[9] + pos[2] * matrix[10] + matrix[11]
+    clip_w = pos[0] * matrix[12] + pos[1] * matrix[13] + pos[2] * matrix[14] + matrix[15]
+
+    if clip_w < 0.1:
+        return None
+
+    ndc_x = clip_x / clip_w
+    ndc_y = clip_y / clip_w
+
+    screen_x = (width / 2) + (ndc_x * width / 2)
+    screen_y = (height / 2) - (ndc_y * height / 2)
+    return screen_x, screen_y
+
+# CS2 Netcon command dispatcher
+def send_cs2_command(command):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.3)
+        s.connect(("127.0.0.1", 2121))
+        s.sendall((command + "\n").encode("utf-8"))
+        s.close()
+        return True
+    except Exception as e:
+        print(f"Netcon command connection failed (Make sure CS2 is run with '-netconport 2121'): {e}")
+        return False
+
+@app.route('/api/command', methods=['POST'])
+def run_command():
+    data = request.get_json() or {}
+    cmd = data.get("command", "")
+    if cmd:
+        success = send_cs2_command(cmd)
+        return jsonify({"status": "success" if success else "failed"})
+    return jsonify({"status": "error", "message": "Command parameter missing"})
+
+@app.route('/api/telemetry', methods=['GET'])
+def get_telemetry():
+    global pm, client_base
+    if pm is None or not pm.process_handle:
+        connect_cs2()
+        
+    if pm is None or client_base == 0:
+        return jsonify({
+            "status": "mock",
+            "message": "CS2 process (cs2.exe) not running. Showing simulated nodes.",
+            "targets": []
+        })
+
+    try:
+        matrix_bytes = pm.read_bytes(client_base + offsets["dwViewMatrix"], 64)
+        view_matrix = [float(x) for x in struct_unpack('16f', matrix_bytes)]
+        
+        local_player_controller = pm.read_longlong(client_base + offsets["dwLocalPlayerController"])
+        local_pawn = pm.read_longlong(client_base + offsets["dwLocalPlayerPawn"])
+        
+        local_pos = (0, 0, 0)
+        if local_pawn:
+            px = pm.read_float(local_pawn + fields["m_vOldOrigin"])
+            py = pm.read_float(local_pawn + fields["m_vOldOrigin"] + 4)
+            pz = pm.read_float(local_pawn + fields["m_vOldOrigin"] + 8)
+            local_pos = (px, py, pz)
+
+        entity_list = pm.read_longlong(client_base + offsets["dwEntityList"])
+        if not entity_list:
+            return jsonify({"status": "error", "message": "Failed to read entity list.", "targets": []})
+
+        targets = []
+        for i in range(1, 64):
+            try:
+                list_entry = pm.read_longlong(entity_list + ((i & 0x7FFF) >> 9) * 8 + 16)
+                if not list_entry:
+                    continue
+                    
+                controller = pm.read_longlong(list_entry + 120 * (i & 0x1FF))
+                if not controller or controller == local_player_controller:
+                    continue
+
+                health = pm.read_int(controller + fields["m_iHealth"])
+                if health <= 0 or health > 100:
+                    continue
+                    
+                team = pm.read_int(controller + fields["m_iTeamNum"])
+                
+                name_bytes = pm.read_bytes(controller + fields["m_sSanitizedPlayerName"], 64)
+                name = name_bytes.split(b'\x00')[0].decode('utf-8', errors='ignore')
+                if not name:
+                    name = f"Bot_{i}"
+
+                pawn_handle = pm.read_uint(controller + fields["m_hPlayerPawn"])
+                if not pawn_handle:
+                    continue
+                    
+                pawn_entry = pm.read_longlong(entity_list + 0x8 * ((pawn_handle & 0x7FFF) >> 9) + 16)
+                if not pawn_entry:
+                    continue
+                    
+                pawn = pm.read_longlong(pawn_entry + 120 * (pawn_handle & 0x1FF))
+                if not pawn or pawn == local_pawn:
+                    continue
+
+                tx = pm.read_float(pawn + fields["m_vOldOrigin"])
+                ty = pm.read_float(pawn + fields["m_vOldOrigin"] + 4)
+                tz = pm.read_float(pawn + fields["m_vOldOrigin"] + 8)
+
+                dx = tx - local_pos[0]
+                dy = ty - local_pos[1]
+                dz = tz - local_pos[2]
+                distance = math.sqrt(dx*dx + dy*dy + dz*dz) * 0.0254
+
+                screen = world_to_screen((tx, ty, tz), view_matrix, 800, 600)
+                
+                if screen:
+                    targets.append({
+                        "id": i,
+                        "name": name,
+                        "x": (screen[0] / 800) * 100,
+                        "y": (screen[1] / 600) * 100,
+                        "vx": 0,
+                        "vy": 0,
+                        "health": health,
+                        "armor": 100,
+                        "team": "Counter-Terrorist" if team == 3 else "Terrorist",
+                        "spotted": True,
+                        "weapon": "AK-47" if team == 2 else "M4A1",
+                        "distance": distance
+                    })
+            except Exception:
+                pass
+
+        return jsonify({
+            "status": "connected",
+            "message": "Real-time CS2 memory hook engaged.",
+            "targets": targets
+        })
+    except Exception as e:
+        pm = None
+        return jsonify({"status": "error", "message": str(e), "targets": []})
+
+import struct
+def struct_unpack(fmt, data):
+    return struct.unpack(fmt, data)
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print(" OBSIDIAN CS2 TELEMETRY LINK SERVER")
+    print("=" * 60)
+    print("Starting Flask listener on http://localhost:5000")
+    print("Connect your HUD React app to receive real-time player data.")
+    print("Press Ctrl+C to stop.")
+    app.run(port=5000, host="0.0.0.0", debug=False)
+
+================================================================================
+
+
+// Dosya Yolu: src/main.tsx
+================================================================================
+import {StrictMode} from 'react';
+import {createRoot} from 'react-dom/client';
+import App from './App.tsx';
+import './index.css';
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+);
+
+================================================================================
+
+
+// Dosya Yolu: src/index.css
+================================================================================
+@import "tailwindcss";
+
+@layer utilities {
+  @keyframes sweep {
+    0% {
+      transform: rotate(0deg);
+    }
+    100% {
+      transform: rotate(360deg);
+    }
+  }
+
+  .animate-sweep {
+    animation: sweep 8s linear infinite;
+  }
+  
+  .animate-spin-slow {
+    animation: sweep 15s linear infinite;
+  }
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/types.ts
+================================================================================
+export interface Target {
+  id: number;
+  name: string;
+  x: number; // percentage of viewport width
+  y: number; // percentage of viewport height
+  vx: number; // velocity x
+  vy: number; // velocity y
+  health: number;
+  armor: number;
+  team: 'Terrorist' | 'Counter-Terrorist';
+  spotted: boolean;
+  weapon: string;
+  distance: number; // in meters
+  bones: { [key: number]: { x: number; y: number } }; // bone ID to relative screen coords
+}
+
+export interface HackConfig {
+  esp_enabled: boolean;
+  esp_box: boolean;
+  esp_box_type: 'full' | 'corner' | '3d';
+  esp_health_bar: boolean;
+  esp_health_bar_style: 'vertical' | 'horizontal';
+  esp_name: boolean;
+  esp_weapon: boolean;
+  esp_distance: boolean;
+  esp_skeleton: boolean;
+  esp_head_dot: boolean;
+  esp_glow: boolean;
+  
+  aimbot_enabled: boolean;
+  aimbot_fov: number; // in degrees / visual pixels
+  aimbot_smooth: number; // lerp weight (1 = instant, higher = slower/smoother)
+  aimbot_bone: string; // "HEAD" | "CHEST" | "PELVIS"
+  aimbot_target_team: boolean;
+  aimbot_rcs: boolean;
+  aimbot_rcs_strength: number;
+  aimbot_auto_fire: boolean;
+  aimbot_visible_check: boolean;
+
+  triggerbot_enabled: boolean;
+  triggerbot_delay: number; // in ms
+  triggerbot_hitchance: number; // 0-100%
+
+  bhop_enabled: boolean;
+  bhop_auto_strafe: boolean;
+  bhop_legit_mode: boolean;
+
+  noflash_enabled: boolean;
+  noflash_max_alpha: number;
+
+  radar_enabled: boolean;
+  radar_scale: number;
+  radar_size: number;
+
+  spectator_list: boolean;
+  bomb_timer: boolean;
+  fps_counter: boolean;
+  watermark: boolean;
+
+  audio_sfx: boolean;
+  vibe_theme: 'obsidian' | 'toxin' | 'crimson' | 'cyberpunk';
+}
+
+export interface TelemetryLog {
+  id: string;
+  timestamp: string;
+  message: string;
+  type: 'info' | 'success' | 'warn' | 'error' | 'critical';
+}
+
+export interface Spectator {
+  id: number;
+  name: string;
+  ping: number;
+  avatar: string;
+  status: 'watching' | 'idle' | 'tracking';
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/data.ts
+================================================================================
+import { Target } from './types';
+
+// Standard Bones
+export const BONES = {
+  HEAD: 6,
+  NECK: 5,
+  CHEST: 4,
+  STOMACH: 3,
+  PELVIS: 0,
+  LEFT_SHOULDER: 13,
+  RIGHT_SHOULDER: 9,
+  LEFT_ELBOW: 14,
+  RIGHT_ELBOW: 10,
+  LEFT_HAND: 15,
+  RIGHT_HAND: 11,
+  LEFT_KNEE: 23,
+  RIGHT_KNEE: 19,
+  LEFT_FOOT: 24,
+  RIGHT_FOOT: 20,
+};
+
+// Generates skeleton bones relative to the target's center bounding box (x, y)
+export function generateSkeletonBones(x: number, y: number, height: number): { [key: number]: { x: number; y: number } } {
+  const w = height * 0.45;
+  return {
+    [BONES.HEAD]: { x: x, y: y - height * 0.42 },
+    [BONES.NECK]: { x: x, y: y - height * 0.32 },
+    [BONES.CHEST]: { x: x, y: y - height * 0.20 },
+    [BONES.STOMACH]: { x: x, y: y - height * 0.05 },
+    [BONES.PELVIS]: { x: x, y: y + height * 0.08 },
+    
+    [BONES.LEFT_SHOULDER]: { x: x - w * 0.35, y: y - height * 0.25 },
+    [BONES.LEFT_ELBOW]: { x: x - w * 0.48, y: y - height * 0.12 },
+    [BONES.LEFT_HAND]: { x: x - w * 0.52, y: y },
+
+    [BONES.RIGHT_SHOULDER]: { x: x + w * 0.35, y: y - height * 0.25 },
+    [BONES.RIGHT_ELBOW]: { x: x + w * 0.48, y: y - height * 0.12 },
+    [BONES.RIGHT_HAND]: { x: x + w * 0.52, y: y },
+
+    [BONES.LEFT_KNEE]: { x: x - w * 0.22, y: y + height * 0.26 },
+    [BONES.LEFT_FOOT]: { x: x - w * 0.25, y: y + height * 0.46 },
+
+    [BONES.RIGHT_KNEE]: { x: x + w * 0.22, y: y + height * 0.26 },
+    [BONES.RIGHT_FOOT]: { x: x + w * 0.25, y: y + height * 0.46 },
+  };
+}
+
+export const INITIAL_TARGETS: Target[] = [
+  {
+    id: 1,
+    name: "Viper_0x",
+    x: 35,
+    y: 40,
+    vx: 0.15,
+    vy: -0.05,
+    health: 84,
+    armor: 100,
+    team: 'Terrorist',
+    spotted: true,
+    weapon: "AK-47",
+    distance: 24.3,
+    bones: generateSkeletonBones(35, 40, 180)
+  },
+  {
+    id: 2,
+    name: "Wraith_CS",
+    x: 65,
+    y: 50,
+    vx: -0.1,
+    vy: 0.12,
+    health: 42,
+    armor: 50,
+    team: 'Terrorist',
+    spotted: false,
+    weapon: "Glock-18",
+    distance: 45.1,
+    bones: generateSkeletonBones(65, 50, 150)
+  },
+  {
+    id: 3,
+    name: "Spectre",
+    x: 50,
+    y: 35,
+    vx: 0.0,
+    vy: 0.05,
+    health: 100,
+    armor: 100,
+    team: 'Counter-Terrorist',
+    spotted: true,
+    weapon: "M4A1-S",
+    distance: 18.7,
+    bones: generateSkeletonBones(50, 35, 210)
+  },
+  {
+    id: 4,
+    name: "Necromancer",
+    x: 20,
+    y: 60,
+    vx: 0.2,
+    vy: -0.1,
+    health: 12,
+    armor: 0,
+    team: 'Terrorist',
+    spotted: true,
+    weapon: "Desert Eagle",
+    distance: 12.4,
+    bones: generateSkeletonBones(20, 60, 220)
+  },
+  {
+    id: 5,
+    name: "Shadow_Walk",
+    x: 80,
+    y: 30,
+    vx: -0.08,
+    vy: -0.05,
+    health: 95,
+    armor: 90,
+    team: 'Counter-Terrorist',
+    spotted: false,
+    weapon: "USP-S",
+    distance: 36.2,
+    bones: generateSkeletonBones(80, 30, 160)
+  }
+];
+
+export const WEAPON_INFO: { [key: string]: { damage: number; fireRate: number; recoil: number; magSize: number } } = {
+  "AK-47": { damage: 36, fireRate: 600, recoil: 8, magSize: 30 },
+  "M4A1-S": { damage: 38, fireRate: 666, recoil: 5, magSize: 20 },
+  "AWP": { damage: 115, fireRate: 41, recoil: 15, magSize: 10 },
+  "Desert Eagle": { damage: 53, fireRate: 267, recoil: 12, magSize: 7 },
+  "Glock-18": { damage: 28, fireRate: 400, recoil: 3, magSize: 20 },
+  "USP-S": { damage: 35, fireRate: 352, recoil: 2, magSize: 12 },
+};
+
+export const GOTHIC_SOUNDS = {
+  click: "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YQAAAAA=", // Tiny silent placeholder
+};
+
+================================================================================
+
+
+// Dosya Yolu: src/App.tsx
+================================================================================
+import React, { useState, useEffect } from 'react';
+import { Target, HackConfig, TelemetryLog } from './types';
+import { INITIAL_TARGETS, BONES } from './data';
+import GameView from './components/GameView';
+import RadarView from './components/RadarView';
+import Menu from './components/Menu';
+import LoggerView from './components/LoggerView';
+import SpectatorList from './components/SpectatorList';
+import BombTimer from './components/BombTimer';
+import { Terminal, Shield, RefreshCw, Skull, Compass, Activity, Volume2, ShieldAlert } from 'lucide-react';
+
+export default function App() {
+  // Global Cheat engine state configuration 
+  const [config, setConfig] = useState<HackConfig>({
+    esp_enabled: true,
+    esp_box: true,
+    esp_box_type: 'corner',
+    esp_health_bar: true,
+    esp_health_bar_style: 'vertical',
+    esp_name: true,
+    esp_weapon: true,
+    esp_distance: true,
+    esp_skeleton: true,
+    esp_head_dot: true,
+    esp_glow: true,
+    
+    aimbot_enabled: true,
+    aimbot_fov: 90,
+    aimbot_smooth: 4.5,
+    aimbot_bone: 'HEAD',
+    aimbot_target_team: false,
+    aimbot_rcs: true,
+    aimbot_rcs_strength: 0.8,
+    aimbot_auto_fire: false,
+    aimbot_visible_check: true,
+
+    triggerbot_enabled: true,
+    triggerbot_delay: 20,
+    triggerbot_hitchance: 90,
+
+    bhop_enabled: true,
+    bhop_auto_strafe: true,
+    bhop_legit_mode: false,
+
+    noflash_enabled: true,
+    noflash_max_alpha: 25,
+
+    radar_enabled: true,
+    radar_scale: 0.5,
+    radar_size: 200,
+
+    spectator_list: true,
+    bomb_timer: true,
+    fps_counter: true,
+    watermark: true,
+
+    audio_sfx: true,
+    vibe_theme: 'obsidian'
+  });
+
+  // Simulation targets list 
+  const [targets, setTargets] = useState<Target[]>(INITIAL_TARGETS);
+
+  // CS2 Live Process Memory Telemetry link states
+  const [isLiveLink, setIsLiveLink] = useState(false);
+  const [liveStatus, setLiveStatus] = useState<'standby' | 'mock' | 'connected'>('standby');
+
+  // Simulated crosshair tracking state
+  const [crosshairPos, setCrosshairPos] = useState({ x: 300, y: 250 });
+
+  // Telemetry event log list
+  const [logs, setLogs] = useState<TelemetryLog[]>([
+    { id: '1', timestamp: '08:14:51', message: 'VAC Bypass devre dışı bırakıldı. cs2.exe işlemi bulundu.', type: 'success' },
+    { id: '2', timestamp: '08:14:52', message: 'client.dll modülü 0x7FFA8F400000 adresine başarıyla haritalandı.', type: 'info' },
+    { id: '3', timestamp: '08:14:53', message: 'PEB bağlantısı başarıyla kesildi.', type: 'success' },
+    { id: '4', timestamp: '08:14:54', message: 'Obsidian Harici Katman ve Telemetri döngüleri aktif edildi.', type: 'info' }
+  ]);
+
+  // Audio auditory SFX simulation
+  const playSfx = (type: 'lock' | 'fire' | 'warn' | 'success') => {
+    if (!config.audio_sfx) return;
+    try {
+      const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+
+      const now = audioCtx.currentTime;
+
+      if (type === 'lock') {
+        // High pitched click/lock
+        osc.frequency.setValueAtTime(880, now);
+        osc.frequency.exponentialRampToValueAtTime(1400, now + 0.08);
+        gain.gain.setValueAtTime(0.04, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.08);
+        osc.start(now);
+        osc.stop(now + 0.08);
+      } else if (type === 'fire') {
+        // Simulated low cyber snap
+        osc.frequency.setValueAtTime(220, now);
+        osc.frequency.exponentialRampToValueAtTime(80, now + 0.1);
+        gain.gain.setValueAtTime(0.1, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+        osc.start(now);
+        osc.stop(now + 0.15);
+      } else if (type === 'warn') {
+        // Double tone warning pulse
+        osc.type = 'sawtooth';
+        osc.frequency.setValueAtTime(330, now);
+        osc.frequency.setValueAtTime(220, now + 0.1);
+        gain.gain.setValueAtTime(0.03, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+        osc.start(now);
+        osc.stop(now + 0.25);
+      } else if (type === 'success') {
+        // Ambient chime
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(523.25, now); // C5
+        osc.frequency.exponentialRampToValueAtTime(783.99, now + 0.15); // G5
+        gain.gain.setValueAtTime(0.05, now);
+        gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+        osc.start(now);
+        osc.stop(now + 0.3);
+      }
+    } catch (e) {
+      // AudioContext support failure, safe failover
+    }
+  };
+
+  // Add a new system log
+  const pushLog = (message: string, type: TelemetryLog['type'] = 'info') => {
+    const now = new Date();
+    const timestamp = now.toTimeString().split(' ')[0];
+    const newLog: TelemetryLog = {
+      id: Math.random().toString(),
+      timestamp,
+      message,
+      type
+    };
+    setLogs((prev) => [newLog, ...prev.slice(0, 48)]); // keep last 50 logs max
+  };
+
+  // Aimbot action triggered callback
+  const handleAimbotTrigger = (targetName: string, bone: string) => {
+    // Avoid spamming identical lock messages
+    setLogs((prev) => {
+      const lastLog = prev[0];
+      if (lastLog && lastLog.message.includes(`AIM_LOCK engaged on ${targetName}`)) {
+        return prev;
+      }
+      playSfx('lock');
+      // Push asynchronous telemetry state log
+      const now = new Date();
+      const timestamp = now.toTimeString().split(' ')[0];
+      const newLog: TelemetryLog = {
+        id: Math.random().toString(),
+        timestamp,
+        message: `Aimbot ${targetName} hedefine kilitlendi [Odak: ${bone === 'HEAD' ? 'KAFA' : (bone === 'CHEST' ? 'GÖĞÜS' : 'PELVİS')}]`,
+        type: 'info'
+      };
+      return [newLog, ...prev.slice(0, 48)];
+    });
+  };
+
+  // Triggerbot simulated weapon fire callback
+  const handleTriggerbotFire = (targetName: string) => {
+    setLogs((prev) => {
+      const lastLog = prev[0];
+      // Throttle rapid trigger fires
+      if (lastLog && lastLog.message.includes(`TRIGGERBOT command sent`)) {
+        return prev;
+      }
+      playSfx('fire');
+      
+      // Simulate inflicting random health damage to the targets
+      setTargets((prevTargets) =>
+        prevTargets.map((t) => {
+          if (t.name === targetName) {
+            const nextHealth = Math.max(0, t.health - Math.floor(Math.random() * 25) - 10);
+            return {
+              ...t,
+              health: nextHealth,
+              spotted: true // make visible upon gunshot
+            };
+          }
+          return t;
+        })
+      );
+
+      const now = new Date();
+      const timestamp = now.toTimeString().split(' ')[0];
+      const newLog: TelemetryLog = {
+        id: Math.random().toString(),
+        timestamp,
+        message: `Triggerbot tetiklendi: ${targetName} hedefine ateş edildi`,
+        type: 'success'
+      };
+      return [newLog, ...prev.slice(0, 48)];
+    });
+  };
+
+  // Bomb detonation warning logging 
+  const handleBombExplode = () => {
+    playSfx('warn');
+    pushLog("C4 zamanlayıcı tetiklendi! Sektör haritası yeniden taranıyor.", "critical");
+    
+    // Revive dead players when bomb resets
+    setTargets((prevTargets) =>
+      prevTargets.map((t) => {
+        if (t.health <= 0) {
+          pushLog(`Sistem ${t.name} hedefini tam canla yeniden başlattı`, 'success');
+          return {
+            ...t,
+            health: 100,
+            spotted: false
+          };
+        }
+        return t;
+      })
+    );
+  };
+
+  // Poll Flask memory dumper telemetry
+  useEffect(() => {
+    let lastStatus = 'standby';
+    const poll = () => {
+      fetch('http://localhost:5000/api/telemetry')
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.status === 'connected') {
+            setIsLiveLink(true);
+            setLiveStatus('connected');
+            if (lastStatus !== 'connected') {
+              pushLog("Canlı CS2 Bellek Bağlantısı Kuruldu!", "success");
+              lastStatus = 'connected';
+            }
+            if (data.targets) {
+              setTargets(data.targets);
+            }
+          } else {
+            setIsLiveLink(false);
+            setLiveStatus(data.status || 'mock');
+            if (lastStatus === 'connected') {
+              pushLog("Canlı CS2 bağlantısı kesildi, simülasyon moduna dönülüyor.", "warn");
+              lastStatus = 'mock';
+            }
+          }
+        })
+        .catch(() => {
+          setIsLiveLink(false);
+          setLiveStatus('mock');
+          if (lastStatus === 'connected') {
+            pushLog("Canlı CS2 bağlantısı koptu, simülasyona dönülüyor.", "warn");
+            lastStatus = 'mock';
+          }
+        });
+    };
+    
+    const interval = setInterval(poll, 60);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Toggle general config change
+  const handleConfigChange = (key: keyof HackConfig, value: any) => {
+    setConfig((prev) => ({
+      ...prev,
+      [key]: value
+    }));
+    pushLog(`Yapılandırma güncellendi: ${String(key)} değeri ${String(value)} yapıldı`, 'info');
+  };
+
+  // Preset loading handler
+  const handleLoadPreset = (theme: 'obsidian' | 'toxin' | 'crimson' | 'cyberpunk') => {
+    playSfx('success');
+    let themeConfig: Partial<HackConfig> = {};
+    if (theme === 'obsidian') {
+      themeConfig = {
+        vibe_theme: 'obsidian',
+        esp_enabled: true,
+        esp_box_type: 'corner',
+        esp_glow: true,
+        aimbot_fov: 90,
+        aimbot_smooth: 4.5,
+      };
+    } else if (theme === 'toxin') {
+      themeConfig = {
+        vibe_theme: 'toxin',
+        esp_enabled: true,
+        esp_box_type: 'full',
+        esp_glow: true,
+        aimbot_fov: 120,
+        aimbot_smooth: 2.0,
+      };
+    } else if (theme === 'crimson') {
+      themeConfig = {
+        vibe_theme: 'crimson',
+        esp_enabled: true,
+        esp_box_type: '3d',
+        esp_glow: true,
+        aimbot_fov: 150,
+        aimbot_smooth: 1.0,
+      };
+    } else if (theme === 'cyberpunk') {
+      themeConfig = {
+        vibe_theme: 'cyberpunk',
+        esp_enabled: true,
+        esp_box_type: 'corner',
+        esp_glow: true,
+        aimbot_fov: 70,
+        aimbot_smooth: 6.0,
+      };
+    }
+
+    setConfig((prev) => ({
+      ...prev,
+      ...themeConfig
+    }));
+    pushLog(`TEMA PROTOKOLÜ AKTİF EDİLDİ: [${theme.toUpperCase()}]`, 'success');
+  };
+
+  // Select theme styles
+  let themeHeaderBorder = 'border-purple-900/60';
+  let glowAccent = 'shadow-[0_0_15px_rgba(168,85,247,0.15)]';
+  let textAccent = 'text-purple-400';
+  let bannerGradient = 'from-purple-950 via-neutral-900 to-purple-950';
+
+  if (config.vibe_theme === 'toxin') {
+    themeHeaderBorder = 'border-green-900/60';
+    glowAccent = 'shadow-[0_0_15px_rgba(34,197,94,0.15)]';
+    textAccent = 'text-green-400';
+    bannerGradient = 'from-green-950 via-neutral-900 to-green-950';
+  } else if (config.vibe_theme === 'crimson') {
+    themeHeaderBorder = 'border-red-900/60';
+    glowAccent = 'shadow-[0_0_15px_rgba(239,68,68,0.15)]';
+    textAccent = 'text-red-400';
+    bannerGradient = 'from-red-950 via-neutral-900 to-red-950';
+  } else if (config.vibe_theme === 'cyberpunk') {
+    themeHeaderBorder = 'border-pink-900/60';
+    glowAccent = 'shadow-[0_0_15px_rgba(236,72,153,0.15)]';
+    textAccent = 'text-pink-400';
+    bannerGradient = 'from-pink-950 via-neutral-900 to-pink-950';
+  }
+
+  return (
+    <div className="min-h-screen bg-neutral-950 text-white flex flex-col font-sans selection:bg-purple-900 selection:text-white">
+      {/* Decorative cybernetic gothic top accent bar */}
+      <div className={`h-1 bg-gradient-to-r ${config.vibe_theme === 'obsidian' ? 'from-purple-600 via-pink-600 to-cyan-500' : (config.vibe_theme === 'toxin' ? 'from-green-500 via-emerald-600 to-yellow-500' : (config.vibe_theme === 'crimson' ? 'from-red-600 via-rose-700 to-orange-500' : 'from-pink-500 via-purple-600 to-blue-500'))}`} />
+
+      {/* Premium Navigation Header */}
+      <header className="bg-neutral-900/80 backdrop-blur-md border-b border-neutral-800/80 px-6 py-4 flex items-center justify-between sticky top-0 z-50">
+        <div className="flex items-center gap-3">
+          <div className="p-2 bg-neutral-950 border border-neutral-800 rounded">
+            <Skull className={`w-5 h-5 ${textAccent} animate-pulse`} />
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-extrabold tracking-tight text-white text-lg">OBSIDIAN TELEMETRİ</span>
+              <span className="bg-purple-950 text-purple-300 text-[9px] px-1.5 py-0.5 rounded border border-purple-800/50 font-mono font-bold">
+                PRO v2.4
+              </span>
+            </div>
+            <p className="text-[10px] text-neutral-500 font-mono">
+              HARİCİ ESP VE OTOMATİK KİLİTLEME KONTROL PANELİ // CS2 İSTEMCİ AĞI
+            </p>
+          </div>
+        </div>
+
+        {/* Global HUD Stats indicators */}
+        <div className="flex items-center gap-6 font-mono text-xs text-neutral-400">
+          <div className={`px-2 py-0.5 rounded text-[9px] font-bold border uppercase transition-all duration-300 ${
+            isLiveLink 
+              ? 'bg-green-950/30 text-green-400 border-green-500/30 shadow-[0_0_8px_rgba(34,197,94,0.2)]' 
+              : 'bg-neutral-950 text-neutral-500 border-neutral-800'
+          }`}>
+            {isLiveLink ? '● CANLI BAĞLANTI' : '○ SİMÜLATÖR MODU'}
+          </div>
+          <div className="hidden md:block">
+            <span className="text-neutral-500">GECİKME:</span>{' '}
+            <span className="text-green-400 font-bold">12ms</span>
+          </div>
+          <div className="hidden md:block">
+            <span className="text-neutral-500">SİMÜLATÖR FPS:</span>{' '}
+            <span className={`font-bold ${config.fps_counter ? 'text-green-400' : 'text-neutral-500'}`}>
+              {config.fps_counter ? '144' : 'N/A'}
+            </span>
+          </div>
+          <div className="bg-neutral-950 px-3 py-1.5 border border-neutral-800 rounded flex items-center gap-1.5">
+            <span className="w-1.5 h-1.5 rounded-full bg-purple-500 animate-ping" />
+            <span className="text-neutral-300">OTURUM: 08:14:51</span>
+          </div>
+        </div>
+      </header>
+
+      {/* Main Responsive Grid Layout containing interactive components */}
+      <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-6 grid grid-cols-1 lg:grid-cols-12 gap-6">
+        
+        {/* Left Side: Game simulation & logs (Grid Span 8) */}
+        <div className="lg:col-span-8 flex flex-col gap-6">
+          
+          {/* Top Banner Notice regarding the simulation purpose */}
+          <div className={`p-4 rounded-lg bg-gradient-to-r ${bannerGradient} border border-neutral-800 flex flex-col md:flex-row items-start md:items-center justify-between gap-3 ${glowAccent} transition-all duration-300`}>
+            <div>
+              <h1 className="text-sm font-sans font-bold text-white flex items-center gap-2">
+                <ShieldAlert className="w-4 h-4 text-purple-400" />
+                TAKTİK HUD KONTROL SİMÜLATÖRÜ
+              </h1>
+              <p className="text-[11px] text-neutral-400 mt-1">
+                Aşağıdaki simüle edilmiş istemci penceresinde hedeflerin üzerine gelebilir, sürükleyebilir ve tıklayabilirsiniz. Çizim biçimlerini, kilitlenme ayarlarını ve renkleri ayarlamak için sağ taraftaki siber-gotik HUD paneli seçeneklerini kullanın.
+              </p>
+            </div>
+            <button
+              onClick={() => {
+                setTargets(INITIAL_TARGETS);
+                pushLog('Simülasyon koordinatları ve varlıkları sıfırlandı', 'info');
+                playSfx('success');
+              }}
+              className="px-3 py-1.5 bg-neutral-950 hover:bg-neutral-900 border border-neutral-800 rounded text-xs font-mono font-bold flex items-center gap-1.5 transition-all"
+            >
+              <RefreshCw size={12} className="text-purple-400" />
+              HEDEFLERİ SIFIRLA
+            </button>
+          </div>
+
+          {/* Core Interactive Simulation View */}
+          <GameView
+            targets={targets}
+            setTargets={setTargets}
+            config={config}
+            crosshairPos={crosshairPos}
+            setCrosshairPos={setCrosshairPos}
+            onAimbotTrigger={handleAimbotTrigger}
+            onTriggerbotFire={handleTriggerbotFire}
+            isLiveLink={isLiveLink}
+          />
+
+          {/* Real-time System Logger Component */}
+          <LoggerView 
+            logs={logs} 
+            onClear={() => {
+              setLogs([]);
+              playSfx('lock');
+            }} 
+          />
+
+        </div>
+
+        {/* Right Side: Options Menu & Telemetry overlays (Grid Span 4) */}
+        <div className="lg:col-span-4 flex flex-col gap-6">
+          
+          {/* Menu Controller Component */}
+          <Menu
+            config={config}
+            onChange={handleConfigChange}
+            onLoadPreset={handleLoadPreset}
+          />
+
+          {/* CS2 Remote Control Widget */}
+          <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-lg backdrop-blur-md space-y-3">
+            <div className="flex items-center justify-between border-b border-neutral-800 pb-1.5 font-mono text-[11px] text-neutral-400">
+              <span className="flex items-center gap-1.5 font-bold text-neutral-200">
+                <Terminal size={12} className="text-purple-400 animate-pulse" />
+                CS2 UZAKTAN KONTROL
+              </span>
+              <span className="text-[9px] text-neutral-500 font-bold">PORT: 2121</span>
+            </div>
+            
+            <p className="text-[10px] text-neutral-400 leading-relaxed font-sans">
+              Steam Başlatma Seçeneklerine <code className="text-purple-400 font-mono bg-neutral-950 px-1 py-0.5 rounded">-netconport 2121</code> kodunu ekleyip oyunu açın. Aşağıdaki butonlarla tek tıkla oyunu yönetin:
+            </p>
+
+            <div className="grid grid-cols-2 gap-2 text-[10px] font-mono">
+              <button
+                onClick={() => {
+                  fetch('http://localhost:5000/api/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: 'map cs_office' })
+                  }).then(() => pushLog("CS2 Komut Gönderildi: map cs_office", "info"));
+                }}
+                className="px-2 py-1.5 bg-purple-950/40 hover:bg-purple-900/60 border border-purple-800/40 text-purple-300 font-bold rounded uppercase transition-colors"
+              >
+                Office Haritası Aç
+              </button>
+              
+              <button
+                onClick={() => {
+                  fetch('http://localhost:5000/api/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: 'sv_cheats 1; mp_autoteambalance 0; mp_limitteams 0; bot_kick; bot_add_t; bot_stop 1; mp_warmup_end' })
+                  }).then(() => pushLog("CS2 Komut Gönderildi: Teke Tek Bot Ekle", "info"));
+                }}
+                className="px-2 py-1.5 bg-green-950/40 hover:bg-green-900/60 border border-green-800/40 text-green-300 font-bold rounded uppercase transition-colors"
+              >
+                Teke Tek Bot Ekle
+              </button>
+
+              <button
+                onClick={() => {
+                  fetch('http://localhost:5000/api/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: 'toggle bot_stop' })
+                  }).then(() => pushLog("CS2 Komut Gönderildi: bot_stop değiştirildi", "info"));
+                }}
+                className="px-2 py-1.5 bg-neutral-800 hover:bg-neutral-700 border border-neutral-700 text-neutral-200 rounded uppercase transition-colors"
+              >
+                Botu Dondur/Çöz
+              </button>
+
+              <button
+                onClick={() => {
+                  fetch('http://localhost:5000/api/command', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command: 'bot_kick' })
+                  }).then(() => pushLog("CS2 Komut Gönderildi: bot_kick", "info"));
+                }}
+                className="px-2 py-1.5 bg-red-950/40 hover:bg-red-900/60 border border-red-800/40 text-red-400 font-bold rounded uppercase transition-colors"
+              >
+                Tüm Botları At
+              </button>
+            </div>
+          </div>
+
+          {/* Radar Component */}
+          {config.radar_enabled && (
+            <RadarView
+              targets={targets}
+              config={config}
+              crosshairPos={crosshairPos}
+            />
+          )}
+
+          {/* Extra Overlays Widgets (Bomb & Observers) */}
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-1 gap-6">
+            <BombTimer config={config} onExplode={handleBombExplode} />
+            <SpectatorList spectatorListEnabled={config.spectator_list} />
+          </div>
+
+        </div>
+
+      </main>
+
+      {/* System Footer info */}
+      <footer className="bg-neutral-950 border-t border-neutral-900 py-4 px-6 text-center text-xs text-neutral-600 font-mono mt-auto flex flex-col sm:flex-row justify-between items-center gap-2">
+        <p className="flex items-center gap-1">
+          <Volume2 size={12} className="text-purple-500 animate-pulse" />
+          İşitsel Ses Sentezi Aktif - Gotik Ambiyans modu etkin
+        </p>
+        <p className="uppercase tracking-widest text-[9px]">
+          LO ONAYLI PANEL // SİBER ALANDA BOZULMAYI ÖNLER
+        </p>
+      </footer>
+    </div>
+  );
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/components/Menu.tsx
+================================================================================
+import React from 'react';
+import { HackConfig } from '../types';
+import { Eye, Shield, Target, Flame, Activity, Compass, Users, Zap, Volume2, Info } from 'lucide-react';
+
+interface MenuProps {
+  config: HackConfig;
+  onChange: (key: keyof HackConfig, value: any) => void;
+  onLoadPreset: (theme: 'obsidian' | 'toxin' | 'crimson' | 'cyberpunk') => void;
+}
+
+export default function Menu({ config, onChange, onLoadPreset }: MenuProps) {
+  return (
+    <div className="bg-neutral-900 border border-neutral-800 rounded-lg overflow-hidden flex flex-col backdrop-blur-md">
+      {/* Menu Header */}
+      <div className="bg-gradient-to-r from-purple-950 via-neutral-900 to-purple-950 p-4 border-b border-neutral-800 flex items-center justify-between">
+        <div>
+          <h2 className="font-sans font-extrabold tracking-tight text-white text-base">
+            OBSIDIAN TELEMETRİ SİSTEMİ
+          </h2>
+          <p className="text-[10px] font-mono text-purple-400">
+            F2 DECK INTERACTION MODE // SÜRÜM 2.4.0
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="w-2.5 h-2.5 rounded-full bg-green-500 animate-pulse border border-black" />
+          <span className="text-[10px] font-mono text-green-500 uppercase tracking-widest font-bold">CANLI_VERİ</span>
+        </div>
+      </div>
+
+      {/* Preset Launcher Buttons */}
+      <div className="p-3 bg-neutral-950 border-b border-neutral-800 flex flex-wrap gap-2 items-center justify-between">
+        <span className="text-[9px] font-mono text-neutral-500 font-bold uppercase">Hazır Tema Şablonları:</span>
+        <div className="flex gap-1">
+          <button
+            onClick={() => onLoadPreset('obsidian')}
+            className={`px-2.5 py-1 text-[10px] font-mono rounded font-bold uppercase transition-all duration-200 border ${
+              config.vibe_theme === 'obsidian'
+                ? 'bg-purple-900/30 text-purple-300 border-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.3)]'
+                : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+            }`}
+          >
+            Obsidian
+          </button>
+          <button
+            onClick={() => onLoadPreset('toxin')}
+            className={`px-2.5 py-1 text-[10px] font-mono rounded font-bold uppercase transition-all duration-200 border ${
+              config.vibe_theme === 'toxin'
+                ? 'bg-green-900/30 text-green-300 border-green-500 shadow-[0_0_8px_rgba(34,197,94,0.3)]'
+                : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+            }`}
+          >
+            Toxin
+          </button>
+          <button
+            onClick={() => onLoadPreset('crimson')}
+            className={`px-2.5 py-1 text-[10px] font-mono rounded font-bold uppercase transition-all duration-200 border ${
+              config.vibe_theme === 'crimson'
+                ? 'bg-red-900/30 text-red-300 border-red-500 shadow-[0_0_8px_rgba(239,68,68,0.3)]'
+                : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+            }`}
+          >
+            Crimson
+          </button>
+          <button
+            onClick={() => onLoadPreset('cyberpunk')}
+            className={`px-2.5 py-1 text-[10px] font-mono rounded font-bold uppercase transition-all duration-200 border ${
+              config.vibe_theme === 'cyberpunk'
+                ? 'bg-pink-900/30 text-pink-300 border-pink-500 shadow-[0_0_8px_rgba(236,72,153,0.3)]'
+                : 'bg-neutral-900 text-neutral-400 border-neutral-800 hover:text-white'
+            }`}
+          >
+            Cyberpunk
+          </button>
+        </div>
+      </div>
+
+      {/* Main Configurations Container */}
+      <div className="p-4 space-y-5 overflow-y-auto max-h-[600px] bg-neutral-900/50">
+        
+        {/* ESP Section */}
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 border-b border-neutral-800 pb-1.5">
+            <Eye size={14} className="text-purple-400" />
+            <h3 className="font-mono text-[11px] font-bold text-neutral-200 uppercase tracking-wider">
+              GELİŞMİŞ GÖRSEL ALGILAMA (ESP)
+            </h3>
+          </div>
+          
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+            {/* Master Toggle */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.esp_enabled}
+                onChange={(e) => onChange('esp_enabled', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span className={config.esp_enabled ? 'text-purple-400 font-bold' : ''}>ESP Aktif</span>
+            </label>
+
+            {/* ESP Box */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_box}
+                onChange={(e) => onChange('esp_box', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Sınır Kutusunu Çiz (Box)</span>
+            </label>
+
+            {/* Skeleton Map */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_skeleton}
+                onChange={(e) => onChange('esp_skeleton', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Kemik İskeletini Çiz</span>
+            </label>
+
+            {/* Head Dot */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_head_dot}
+                onChange={(e) => onChange('esp_head_dot', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Kritik Kafa Noktası</span>
+            </label>
+
+            {/* Health Bar */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_health_bar}
+                onChange={(e) => onChange('esp_health_bar', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Sağlık & Zırh Barları</span>
+            </label>
+
+            {/* Render Glow Overlay */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_glow}
+                onChange={(e) => onChange('esp_glow', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Dış Işıma Efekti (Glow)</span>
+            </label>
+
+            {/* Name Tags */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_name}
+                onChange={(e) => onChange('esp_name', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Hedef İsim Etiketleri</span>
+            </label>
+
+            {/* Display Weapon */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_weapon}
+                onChange={(e) => onChange('esp_weapon', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Taşıdığı Silah Bilgisi</span>
+            </label>
+
+            {/* Distance Indicator */}
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.esp_enabled}
+                checked={config.esp_distance}
+                onChange={(e) => onChange('esp_distance', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.esp_enabled ? 'opacity-40' : ''}>Telemetrik Mesafe</span>
+            </label>
+          </div>
+
+          {/* Sub options dropdown */}
+          <div className="grid grid-cols-2 gap-3 mt-2 bg-neutral-950/40 p-2.5 border border-neutral-800/60 rounded">
+            <div>
+              <span className="block text-[9px] font-mono text-neutral-500 uppercase font-bold mb-1">
+                ESP KUTU TİPİ
+              </span>
+              <select
+                disabled={!config.esp_enabled}
+                value={config.esp_box_type}
+                onChange={(e) => onChange('esp_box_type', e.target.value)}
+                className="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1 text-xs text-neutral-200 focus:ring-0 disabled:opacity-30"
+              >
+                <option value="full">Tam Kare (Full Box)</option>
+                <option value="corner">Taktik Köşeler</option>
+                <option value="3d">Yarı-3D İzometrik</option>
+              </select>
+            </div>
+            <div>
+              <span className="block text-[9px] font-mono text-neutral-500 uppercase font-bold mb-1">
+                SAĞLIK BARI STİLİ
+              </span>
+              <select
+                disabled={!config.esp_enabled}
+                value={config.esp_health_bar_style}
+                onChange={(e) => onChange('esp_health_bar_style', e.target.value)}
+                className="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1 text-xs text-neutral-200 focus:ring-0 disabled:opacity-30"
+              >
+                <option value="vertical">Dikey Sol</option>
+                <option value="horizontal">Yatay Alt</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        {/* Dynamic Aimbot Control panel */}
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 border-b border-neutral-800 pb-1.5">
+            <Target size={14} className="text-purple-400" />
+            <h3 className="font-mono text-[11px] font-bold text-neutral-200 uppercase tracking-wider">
+              OTOMATİK HEDEF HİZALAYICI (AIMBOT)
+            </h3>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.aimbot_enabled}
+                onChange={(e) => onChange('aimbot_enabled', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span className={config.aimbot_enabled ? 'text-purple-400 font-bold' : ''}>Aimbot Kilitlemesi</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.aimbot_enabled}
+                checked={config.aimbot_rcs}
+                onChange={(e) => onChange('aimbot_rcs', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.aimbot_enabled ? 'opacity-40' : ''}>Geri Tepme Kontrolü (RCS)</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.aimbot_enabled}
+                checked={config.aimbot_target_team}
+                onChange={(e) => onChange('aimbot_target_team', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.aimbot_enabled ? 'opacity-40' : ''}>Takım Arkadaşlarına Kilitle</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.aimbot_enabled}
+                checked={config.aimbot_visible_check}
+                onChange={(e) => onChange('aimbot_visible_check', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.aimbot_enabled ? 'opacity-40' : ''}>Sadece Görünür Hedefler</span>
+            </label>
+          </div>
+
+          <div className="bg-neutral-950/40 p-3 border border-neutral-800/60 rounded space-y-3">
+            {/* FOV Slider */}
+            <div>
+              <div className="flex justify-between text-[10px] font-mono text-neutral-400 mb-1">
+                <span>KİLİTLEME GÖRÜŞ ALANI (FOV) LİMİTİ</span>
+                <span className="text-purple-400 font-bold">{config.aimbot_fov.toFixed(0)}px</span>
+              </div>
+              <input
+                type="range"
+                min="20"
+                max="250"
+                disabled={!config.aimbot_enabled}
+                value={config.aimbot_fov}
+                onChange={(e) => onChange('aimbot_fov', Number(e.target.value))}
+                className="w-full h-1 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-30"
+              />
+            </div>
+
+            {/* Smooth factor slider */}
+            <div>
+              <div className="flex justify-between text-[10px] font-mono text-neutral-400 mb-1">
+                <span>HASSASİYET YUMUŞATMA FAKTÖRÜ</span>
+                <span className="text-purple-400 font-bold">{config.aimbot_smooth.toFixed(1)}x</span>
+              </div>
+              <input
+                type="range"
+                min="1.0"
+                max="15.0"
+                step="0.5"
+                disabled={!config.aimbot_enabled}
+                value={config.aimbot_smooth}
+                onChange={(e) => onChange('aimbot_smooth', Number(e.target.value))}
+                className="w-full h-1 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-30"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <span className="block text-[9px] font-mono text-neutral-500 uppercase font-bold mb-1">
+                  Hedef Kemik Odağı
+                </span>
+                <select
+                  disabled={!config.aimbot_enabled}
+                  value={config.aimbot_bone}
+                  onChange={(e) => onChange('aimbot_bone', e.target.value)}
+                  className="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1 text-xs text-neutral-200 focus:ring-0 disabled:opacity-30"
+                >
+                  <option value="HEAD">Kemik: 6 [KAFA]</option>
+                  <option value="CHEST">Kemik: 4 [GÖĞÜS]</option>
+                  <option value="PELVIS">Kemik: 0 [PELVİS]</option>
+                </select>
+              </div>
+              <div>
+                <span className="block text-[9px] font-mono text-neutral-500 uppercase font-bold mb-1">
+                  RCS Matris Gücü
+                </span>
+                <select
+                  disabled={!config.aimbot_enabled || !config.aimbot_rcs}
+                  value={config.aimbot_rcs_strength}
+                  onChange={(e) => onChange('aimbot_rcs_strength', Number(e.target.value))}
+                  className="w-full bg-neutral-900 border border-neutral-800 rounded px-2 py-1 text-xs text-neutral-200 focus:ring-0 disabled:opacity-30"
+                >
+                  <option value="0.5">50% Telafi</option>
+                  <option value="0.8">80% Varsayılan</option>
+                  <option value="1.0">100% Tam Kilitleme</option>
+                </select>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* Triggerbot and Hop Sections */}
+        <div className="grid grid-cols-2 gap-4">
+          
+          {/* Triggerbot Panel */}
+          <div className="bg-neutral-950/40 p-3 border border-neutral-800/60 rounded space-y-2.5">
+            <div className="flex items-center gap-1.5 border-b border-neutral-800 pb-1">
+              <Flame size={12} className="text-purple-400" />
+              <h4 className="font-mono text-[9px] font-bold text-neutral-200 uppercase tracking-wider">
+                OTOMATİK ATEŞLEME
+              </h4>
+            </div>
+
+            <label className="flex items-center gap-2 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.triggerbot_enabled}
+                onChange={(e) => onChange('triggerbot_enabled', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span className={config.triggerbot_enabled ? 'text-purple-400 font-bold' : ''}>Aktif Ateş</span>
+            </label>
+
+            <div>
+              <div className="flex justify-between text-[8px] font-mono text-neutral-500 mb-0.5">
+                <span>GECİKME SÜRESİ</span>
+                <span className="text-white">{config.triggerbot_delay}ms</span>
+              </div>
+              <input
+                type="range"
+                min="0"
+                max="150"
+                step="5"
+                disabled={!config.triggerbot_enabled}
+                value={config.triggerbot_delay}
+                onChange={(e) => onChange('triggerbot_delay', Number(e.target.value))}
+                className="w-full h-1 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-30"
+              />
+            </div>
+
+            <div>
+              <div className="flex justify-between text-[8px] font-mono text-neutral-500 mb-0.5">
+                <span>İSABET ORANI</span>
+                <span className="text-white">{config.triggerbot_hitchance}%</span>
+              </div>
+              <input
+                type="range"
+                min="20"
+                max="100"
+                disabled={!config.triggerbot_enabled}
+                value={config.triggerbot_hitchance}
+                onChange={(e) => onChange('triggerbot_hitchance', Number(e.target.value))}
+                className="w-full h-1 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-30"
+              />
+            </div>
+          </div>
+
+          {/* Bunnyhop Panel */}
+          <div className="bg-neutral-950/40 p-3 border border-neutral-800/60 rounded space-y-2.5">
+            <div className="flex items-center gap-1.5 border-b border-neutral-800 pb-1">
+              <Zap size={12} className="text-purple-400" />
+              <h4 className="font-mono text-[9px] font-bold text-neutral-200 uppercase tracking-wider">
+                OTOMATİK ZIPLAMA (BHOP)
+              </h4>
+            </div>
+
+            <label className="flex items-center gap-2 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.bhop_enabled}
+                onChange={(e) => onChange('bhop_enabled', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span className={config.bhop_enabled ? 'text-purple-400 font-bold' : ''}>BHOP Aktif</span>
+            </label>
+
+            <label className="flex items-center gap-2 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.bhop_enabled}
+                checked={config.bhop_auto_strafe}
+                onChange={(e) => onChange('bhop_auto_strafe', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.bhop_enabled ? 'opacity-40' : ''}>Otomatik Hava Yönü</span>
+            </label>
+
+            <label className="flex items-center gap-2 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                disabled={!config.bhop_enabled}
+                checked={config.bhop_legit_mode}
+                onChange={(e) => onChange('bhop_legit_mode', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0 disabled:opacity-30"
+              />
+              <span className={!config.bhop_enabled ? 'opacity-40' : ''}>İnsansı Yumuşak Bhop</span>
+            </label>
+          </div>
+        </div>
+
+        {/* Miscellaneous Features */}
+        <div className="space-y-3">
+          <div className="flex items-center gap-2 border-b border-neutral-800 pb-1.5">
+            <Activity size={14} className="text-purple-400" />
+            <h3 className="font-mono text-[11px] font-bold text-neutral-200 uppercase tracking-wider">
+              EK TELEMETRİ GÖSTERGELERİ (WIDGETS)
+            </h3>
+          </div>
+
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2">
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.radar_enabled}
+                onChange={(e) => onChange('radar_enabled', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span>Canlı Vektör Radarı</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.spectator_list}
+                onChange={(e) => onChange('spectator_list', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span>İzleyici Kontrol Listesi</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.bomb_timer}
+                onChange={(e) => onChange('bomb_timer', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span>Bomba (C4) Patlama Saati</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.noflash_enabled}
+                onChange={(e) => onChange('noflash_enabled', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span>Körlük Engelleyici (Anti-Flash)</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.watermark}
+                onChange={(e) => onChange('watermark', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span>Filigran Logosu Göster</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.fps_counter}
+                onChange={(e) => onChange('fps_counter', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span>FPS & Ping Göstergesi</span>
+            </label>
+
+            <label className="flex items-center gap-2.5 cursor-pointer text-xs text-neutral-300 hover:text-white select-none">
+              <input
+                type="checkbox"
+                checked={config.audio_sfx}
+                onChange={(e) => onChange('audio_sfx', e.target.checked)}
+                className="rounded border-neutral-800 bg-neutral-950 text-purple-600 focus:ring-0"
+              />
+              <span className="flex items-center gap-1">
+                <Volume2 size={12} className="text-purple-400" />
+                Siber Ses Efektleri (SFX)
+              </span>
+            </label>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 bg-neutral-950/40 p-2.5 border border-neutral-800/60 rounded">
+            <div>
+              <span className="block text-[9px] font-mono text-neutral-500 uppercase font-bold mb-1">
+                RADAR ÖLÇEK KATSAYISI
+              </span>
+              <input
+                type="range"
+                min="0.1"
+                max="1.0"
+                step="0.05"
+                disabled={!config.radar_enabled}
+                value={config.radar_scale}
+                onChange={(e) => onChange('radar_scale', Number(e.target.value))}
+                className="w-full h-1 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-30"
+              />
+            </div>
+            <div>
+              <span className="block text-[9px] font-mono text-neutral-500 uppercase font-bold mb-1">
+                ANTİ-FLASH ETKİ LİMİTİ
+              </span>
+              <input
+                type="range"
+                min="0"
+                max="100"
+                disabled={!config.noflash_enabled}
+                value={config.noflash_max_alpha}
+                onChange={(e) => onChange('noflash_max_alpha', Number(e.target.value))}
+                className="w-full h-1 bg-neutral-800 rounded-lg appearance-none cursor-pointer accent-purple-500 disabled:opacity-30"
+              />
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Menu Footer */}
+      <div className="bg-neutral-950 p-3.5 border-t border-neutral-800 flex justify-between items-center text-[10px] font-mono text-neutral-500">
+        <span className="flex items-center gap-1">
+          <Info size={12} className="text-purple-400" />
+          F2: TIKLAMA GEÇİŞ SİMÜLASYONU
+        </span>
+        <span className="text-purple-400/80 font-bold uppercase tracking-wider">
+          AKADEMİK VE TANITIM ALANI
+        </span>
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/components/GameView.tsx
+================================================================================
+import React, { useEffect, useRef, useState } from 'react';
+import { Target, HackConfig } from '../types';
+import { BONES } from '../data';
+import { Eye, Shield, Target as CrosshairIcon, Crosshair } from 'lucide-react';
+
+interface GameViewProps {
+  targets: Target[];
+  setTargets: React.Dispatch<React.SetStateAction<Target[]>>;
+  config: HackConfig;
+  crosshairPos: { x: number; y: number };
+  setCrosshairPos: React.Dispatch<React.SetStateAction<{ x: number; y: number }>>;
+  onAimbotTrigger: (targetName: string, bone: string) => void;
+  onTriggerbotFire: (targetName: string) => void;
+  isLiveLink?: boolean;
+}
+
+export default function GameView({
+  targets,
+  setTargets,
+  config,
+  crosshairPos,
+  setCrosshairPos,
+  onAimbotTrigger,
+  onTriggerbotFire,
+  isLiveLink = false
+}: GameViewProps) {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [hoveredTarget, setHoveredTarget] = useState<Target | null>(null);
+  const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const [flashIntensity, setFlashIntensity] = useState(0); // 0 to 1 for simulation
+
+  // Handle ResizeObserver to get concrete dimensions of parent container
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (let entry of entries) {
+        const { width, height } = entry.contentRect;
+        setDimensions({ width: width || 800, height: height || 500 });
+      }
+    });
+    resizeObserver.observe(containerRef.current);
+    return () => resizeObserver.disconnect();
+  }, []);
+
+  // Update canvas sizing
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.width = dimensions.width;
+    canvas.height = dimensions.height;
+  }, [dimensions]);
+
+  // Handle flash effect interval simulation (flashes occasionally)
+  useEffect(() => {
+    const interval = setInterval(() => {
+      // Simulate getting flashed
+      setFlashIntensity(0.9);
+      const fadeInterval = setInterval(() => {
+        setFlashIntensity((prev) => {
+          const maxAlphaLimit = config.noflash_enabled ? config.noflash_max_alpha / 100 : 1.0;
+          const decay = 0.04;
+          const next = prev - decay;
+          if (next <= 0) {
+            clearInterval(fadeInterval);
+            return 0;
+          }
+          return Math.min(next, maxAlphaLimit);
+        });
+      }, 50);
+    }, 18000); // gets flashed every 18 seconds
+
+    return () => clearInterval(interval);
+  }, [config.noflash_enabled, config.noflash_max_alpha]);
+
+  // Game/Telemetry Simulation Loop
+  useEffect(() => {
+    if (isLiveLink) return;
+    let animationFrameId: number;
+    const updatePhysics = () => {
+      setTargets((prevTargets) =>
+        prevTargets.map((target) => {
+          // Bounce on walls
+          let nx = target.x + target.vx;
+          let ny = target.y + target.vy;
+          let nvx = target.vx;
+          let nvy = target.vy;
+
+          if (nx < 10 || nx > 90) {
+            nvx = -nvx;
+            nx = Math.max(10, Math.min(90, nx));
+          }
+          if (ny < 15 || ny > 85) {
+            nvy = -nvy;
+            ny = Math.max(15, Math.min(85, ny));
+          }
+
+          // Generate simulated skeleton bones based on target's calculated height
+          const height = target.id === 3 ? 210 : (target.id === 4 ? 220 : 180);
+          const w = height * 0.45;
+          const pixelX = (nx / 100) * dimensions.width;
+          const pixelY = (ny / 100) * dimensions.height;
+
+          // Re-generate relative relative coordinates
+          const bones = {
+            [BONES.HEAD]: { x: pixelX, y: pixelY - height * 0.42 },
+            [BONES.NECK]: { x: pixelX, y: pixelY - height * 0.32 },
+            [BONES.CHEST]: { x: pixelX, y: pixelY - height * 0.20 },
+            [BONES.STOMACH]: { x: pixelX, y: pixelY - height * 0.05 },
+            [BONES.PELVIS]: { x: pixelX, y: pixelY + height * 0.08 },
+            [BONES.LEFT_SHOULDER]: { x: pixelX - w * 0.35, y: pixelY - height * 0.25 },
+            [BONES.LEFT_ELBOW]: { x: pixelX - w * 0.48, y: pixelY - height * 0.12 },
+            [BONES.LEFT_HAND]: { x: pixelX - w * 0.52, y: pixelY },
+            [BONES.RIGHT_SHOULDER]: { x: pixelX + w * 0.35, y: pixelY - height * 0.25 },
+            [BONES.RIGHT_ELBOW]: { x: pixelX + w * 0.48, y: pixelY - height * 0.12 },
+            [BONES.RIGHT_HAND]: { x: pixelX + w * 0.52, y: pixelY },
+            [BONES.LEFT_KNEE]: { x: pixelX - w * 0.22, y: pixelY + height * 0.26 },
+            [BONES.LEFT_FOOT]: { x: pixelX - w * 0.25, y: pixelY + height * 0.46 },
+            [BONES.RIGHT_KNEE]: { x: pixelX + w * 0.22, y: pixelY + height * 0.26 },
+            [BONES.RIGHT_FOOT]: { x: pixelX + w * 0.25, y: pixelY + height * 0.46 },
+          };
+
+          return {
+            ...target,
+            x: nx,
+            y: ny,
+            vx: nvx,
+            vy: nvy,
+            bones
+          };
+        })
+      );
+      animationFrameId = requestAnimationFrame(updatePhysics);
+    };
+
+    animationFrameId = requestAnimationFrame(updatePhysics);
+    return () => cancelAnimationFrame(animationFrameId);
+  }, [dimensions, setTargets, isLiveLink]);
+
+  // Aimbot and triggerbot execution loop inside the simulated client view
+  useEffect(() => {
+    if (!config.aimbot_enabled && !config.triggerbot_enabled) return;
+
+    const interval = setInterval(() => {
+      // Find closest target within FOV
+      let bestTarget: Target | null = null;
+      let minDistanceToCrosshair = Infinity;
+
+      targets.forEach((target) => {
+        // Skip team if we shouldn't aim at team
+        if (target.team === 'Counter-Terrorist' && !config.aimbot_target_team) return;
+        if (config.aimbot_visible_check && !target.spotted) return;
+
+        // Get target pixel coords
+        const headBone = target.bones[BONES.HEAD];
+        if (!headBone) return;
+
+        const dx = headBone.x - crosshairPos.x;
+        const dy = headBone.y - crosshairPos.y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        // Check FOV limit (simulated in pixels)
+        if (dist < config.aimbot_fov && dist < minDistanceToCrosshair) {
+          minDistanceToCrosshair = dist;
+          bestTarget = target;
+        }
+      });
+
+      // Execute Aimbot if target found
+      if (config.aimbot_enabled && bestTarget) {
+        const target: Target = bestTarget;
+        const boneKey = config.aimbot_bone === 'HEAD' ? BONES.HEAD : (config.aimbot_bone === 'CHEST' ? BONES.CHEST : BONES.PELVIS);
+        const aimBone = target.bones[boneKey] || target.bones[BONES.HEAD];
+
+        if (aimBone) {
+          // Linear interpolation based on config.aimbot_smooth
+          const speed = 1 / Math.max(1, config.aimbot_smooth);
+          const nextX = crosshairPos.x + (aimBone.x - crosshairPos.x) * speed;
+          const nextY = crosshairPos.y + (aimBone.y - crosshairPos.y) * speed;
+
+          setCrosshairPos({ x: nextX, y: nextY });
+          onAimbotTrigger(target.name, config.aimbot_bone);
+        }
+      }
+
+      // Execute Triggerbot if crosshair is directly overlapping any target head/chest bone
+      if (config.triggerbot_enabled) {
+        targets.forEach((target) => {
+          if (target.team === 'Counter-Terrorist' && !config.aimbot_target_team) return;
+          
+          const head = target.bones[BONES.HEAD];
+          const chest = target.bones[BONES.CHEST];
+
+          if (head) {
+            const hDist = Math.sqrt(Math.pow(head.x - crosshairPos.x, 2) + Math.pow(head.y - crosshairPos.y, 2));
+            if (hDist < 12) { // very close threshold
+              setTimeout(() => {
+                if (Math.random() * 100 <= config.triggerbot_hitchance) {
+                  onTriggerbotFire(target.name);
+                }
+              }, config.triggerbot_delay);
+            }
+          }
+          if (chest) {
+            const cDist = Math.sqrt(Math.pow(chest.x - crosshairPos.x, 2) + Math.pow(chest.y - crosshairPos.y, 2));
+            if (cDist < 18) {
+              setTimeout(() => {
+                if (Math.random() * 100 <= config.triggerbot_hitchance) {
+                  onTriggerbotFire(target.name);
+                }
+              }, config.triggerbot_delay);
+            }
+          }
+        });
+      }
+    }, 30);
+
+    return () => clearInterval(interval);
+  }, [config, targets, crosshairPos, setCrosshairPos, onAimbotTrigger, onTriggerbotFire]);
+
+  // Handle manual canvas cursor targeting mouse move
+  const handleMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    
+    // Smooth transition unless aimbot is currently locking onto target
+    setCrosshairPos({ x: mx, y: my });
+
+    // Check for target hovering
+    let hovered: Target | null = null;
+    targets.forEach((target) => {
+      const head = target.bones[BONES.HEAD];
+      if (head) {
+        const height = target.id === 3 ? 210 : (target.id === 4 ? 220 : 180);
+        const w = height * 0.45;
+        // Bounding box approximation
+        const minX = head.x - w / 2;
+        const maxX = head.x + w / 2;
+        const minY = head.y;
+        const maxY = head.y + height;
+
+        if (mx >= minX && mx <= maxX && my >= minY && my <= maxY) {
+          hovered = target;
+        }
+      }
+    });
+    setHoveredTarget(hovered);
+  };
+
+  // Draw HUD rendering over simulated environment on actual canvas for performance
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    // Clear background
+    ctx.clearRect(0, 0, dimensions.width, dimensions.height);
+
+    // Draw grid map representing the 3D map bounds
+    ctx.strokeStyle = 'rgba(120, 20, 20, 0.05)';
+    ctx.lineWidth = 1;
+    const gridSize = 40;
+    for (let i = 0; i < dimensions.width; i += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(i, 0);
+      ctx.lineTo(i, dimensions.height);
+      ctx.stroke();
+    }
+    for (let j = 0; j < dimensions.height; j += gridSize) {
+      ctx.beginPath();
+      ctx.moveTo(0, j);
+      ctx.lineTo(dimensions.width, j);
+      ctx.stroke();
+    }
+
+    // Render each target
+    targets.forEach((target) => {
+      const head = target.bones[BONES.HEAD];
+      const feet = target.bones[BONES.RIGHT_FOOT] || target.bones[BONES.LEFT_FOOT];
+      if (!head || !feet) return;
+
+      const height = target.id === 3 ? 210 : (target.id === 4 ? 220 : 180);
+      const width = height * 0.45;
+      const x = head.x - width / 2;
+      const y = head.y;
+
+      // Check if target is teammate vs enemy
+      const isTeammate = target.team === 'Counter-Terrorist';
+      
+      // Determine core color based on vibe theme
+      let primaryColor = 'rgb(239, 68, 68)'; // Tailwind red-500
+      let secondColor = 'rgba(239, 68, 68, 0.05)';
+      if (isTeammate) {
+        primaryColor = 'rgb(59, 130, 246)'; // blue-500
+        secondColor = 'rgba(59, 130, 246, 0.05)';
+      } else if (config.vibe_theme === 'toxin') {
+        primaryColor = 'rgb(34, 197, 94)'; // green-500
+        secondColor = 'rgba(34, 197, 94, 0.05)';
+      } else if (config.vibe_theme === 'obsidian') {
+        primaryColor = target.spotted ? 'rgb(249, 115, 22)' : 'rgb(168, 85, 247)'; // Orange vs Purple
+        secondColor = target.spotted ? 'rgba(249, 115, 22, 0.05)' : 'rgba(168, 85, 247, 0.05)';
+      } else if (config.vibe_theme === 'cyberpunk') {
+        primaryColor = 'rgb(236, 72, 153)'; // pink-500
+        secondColor = 'rgba(236, 72, 153, 0.05)';
+      }
+
+      // If glow is enabled, render ambient box background shadow
+      if (config.esp_glow) {
+        ctx.shadowBlur = 10;
+        ctx.shadowColor = primaryColor;
+      } else {
+        ctx.shadowBlur = 0;
+      }
+
+      // Draw ESP box
+      if (config.esp_enabled && config.esp_box) {
+        ctx.lineWidth = 1.0;
+        ctx.strokeStyle = primaryColor;
+        ctx.fillStyle = secondColor;
+
+        if (config.esp_box_type === 'corner') {
+          const cSize = Math.min(width, height) * 0.20;
+          // Top Left Corner
+          ctx.beginPath();
+          ctx.moveTo(x + cSize, y); ctx.lineTo(x, y); ctx.lineTo(x, y + cSize);
+          ctx.stroke();
+
+          // Top Right Corner
+          ctx.beginPath();
+          ctx.moveTo(x + width - cSize, y); ctx.lineTo(x + width, y); ctx.lineTo(x + width, y + cSize);
+          ctx.stroke();
+
+          // Bottom Left Corner
+          ctx.beginPath();
+          ctx.moveTo(x, y + height - cSize); ctx.lineTo(x, y + height); ctx.lineTo(x + cSize, y + height);
+          ctx.stroke();
+
+          // Bottom Right Corner
+          ctx.beginPath();
+          ctx.moveTo(x + width - cSize, y + height); ctx.lineTo(x + width, y + height); ctx.lineTo(x + width, y + height - cSize);
+          ctx.stroke();
+          
+          // Fill transparency slightly
+          ctx.fillRect(x, y, width, height);
+        } else if (config.esp_box_type === '3d') {
+          // Render a simple pseudo-3D rotating box
+          const offset = 8;
+          ctx.beginPath();
+          ctx.rect(x, y, width, height);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.rect(x + offset, y - offset, width, height);
+          ctx.stroke();
+          // Connect corners
+          ctx.beginPath();
+          ctx.moveTo(x, y); ctx.lineTo(x + offset, y - offset);
+          ctx.moveTo(x + width, y); ctx.lineTo(x + width + offset, y - offset);
+          ctx.moveTo(x, y + height); ctx.lineTo(x + offset, y + height - offset);
+          ctx.moveTo(x + width, y + height); ctx.lineTo(x + width + offset, y + height - offset);
+          ctx.stroke();
+        } else {
+          // Full solid box
+          ctx.beginPath();
+          ctx.rect(x, y, width, height);
+          ctx.stroke();
+          ctx.fillRect(x, y, width, height);
+        }
+      }
+
+      // Reset shadows for details
+      ctx.shadowBlur = 0;
+
+      // Draw skeleton linkages
+      if (config.esp_enabled && config.esp_skeleton) {
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
+        
+        // Define links
+        const links = [
+          [BONES.HEAD, BONES.NECK],
+          [BONES.NECK, BONES.CHEST],
+          [BONES.CHEST, BONES.STOMACH],
+          [BONES.STOMACH, BONES.PELVIS],
+          
+          [BONES.CHEST, BONES.LEFT_SHOULDER],
+          [BONES.LEFT_SHOULDER, BONES.LEFT_ELBOW],
+          [BONES.LEFT_ELBOW, BONES.LEFT_HAND],
+
+          [BONES.CHEST, BONES.RIGHT_SHOULDER],
+          [BONES.RIGHT_SHOULDER, BONES.RIGHT_ELBOW],
+          [BONES.RIGHT_ELBOW, BONES.RIGHT_HAND],
+
+          [BONES.PELVIS, BONES.LEFT_KNEE],
+          [BONES.LEFT_KNEE, BONES.LEFT_FOOT],
+
+          [BONES.PELVIS, BONES.RIGHT_KNEE],
+          [BONES.RIGHT_KNEE, BONES.RIGHT_FOOT],
+        ];
+
+        ctx.beginPath();
+        links.forEach(([b1, b2]) => {
+          const pt1 = target.bones[b1];
+          const pt2 = target.bones[b2];
+          if (pt1 && pt2) {
+            ctx.moveTo(pt1.x, pt1.y);
+            ctx.lineTo(pt2.x, pt2.y);
+          }
+        });
+        ctx.stroke();
+      }
+
+      // Draw head dot
+      if (config.esp_enabled && config.esp_head_dot) {
+        ctx.fillStyle = primaryColor;
+        ctx.beginPath();
+        ctx.arc(head.x, head.y, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 0.8;
+        ctx.stroke();
+      }
+
+      // Draw health and armor bars
+      if (config.esp_enabled && config.esp_health_bar) {
+        const barSize = 2.5;
+        const spacing = 6;
+
+        if (config.esp_health_bar_style === 'horizontal') {
+          const hWidth = width * (target.health / 100);
+          
+          // Horizontal Health Bar under the box
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+          ctx.fillRect(x, y + height + spacing, width, barSize);
+          
+          // Dynamic health color
+          ctx.fillStyle = target.health > 50 ? '#22c55e' : (target.health > 20 ? '#eab308' : '#ef4444');
+          ctx.fillRect(x, y + height + spacing, hWidth, barSize);
+
+          // Horizontal Armor Bar below health bar
+          if (target.armor > 0) {
+            const aWidth = width * (target.armor / 100);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            ctx.fillRect(x, y + height + spacing + barSize + 2, width, barSize);
+            ctx.fillStyle = '#3b82f6'; // Armor Blue
+            ctx.fillRect(x, y + height + spacing + barSize + 2, aWidth, barSize);
+          }
+        } else {
+          const hHeight = height * (target.health / 100);
+
+          // Vertical Health Bar left of the box
+          ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+          ctx.fillRect(x - barSize - spacing, y, barSize, height);
+          
+          // Dynamic health color
+          ctx.fillStyle = target.health > 50 ? '#22c55e' : (target.health > 20 ? '#eab308' : '#ef4444');
+          ctx.fillRect(x - barSize - spacing, y + (height - hHeight), barSize, hHeight);
+
+          // Armor Bar on the right side if present
+          if (target.armor > 0) {
+            const aHeight = height * (target.armor / 100);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.6)';
+            ctx.fillRect(x + width + spacing, y, barSize, height);
+            ctx.fillStyle = '#3b82f6'; // Armor Blue
+            ctx.fillRect(x + width + spacing, y + (height - aHeight), barSize, aHeight);
+          }
+        }
+      }
+
+      // Render Text indicators
+      if (config.esp_enabled) {
+        ctx.fillStyle = '#ffffff';
+        ctx.font = 'bold 10px "JetBrains Mono", monospace';
+        ctx.textAlign = 'left';
+
+        let currentTextY = y - 6;
+
+        // Display Name & Entity Index ID
+        if (config.esp_name) {
+          ctx.fillText(`[${target.id}] ${target.name}`, x, currentTextY);
+          currentTextY -= 12;
+        }
+
+        // Display distance below the box
+        let bottomTextY = y + height + 12;
+        if (config.esp_weapon) {
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+          ctx.fillText(target.weapon, x, bottomTextY);
+          bottomTextY += 12;
+        }
+
+        if (config.esp_distance) {
+          ctx.fillStyle = 'rgba(147, 197, 253, 0.9)'; // blue-300
+          ctx.fillText(`${target.distance.toFixed(1)}m`, x, bottomTextY);
+        }
+      }
+    });
+
+    // Render Aimbot FOV limit ring
+    if (config.aimbot_enabled) {
+      ctx.strokeStyle = 'rgba(239, 68, 68, 0.25)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.arc(crosshairPos.x, crosshairPos.y, config.aimbot_fov, 0, Math.PI * 2);
+      ctx.stroke();
+      ctx.setLineDash([]); // clear dash
+    }
+
+    // Render local user flashbang simulation screen cover
+    if (flashIntensity > 0) {
+      ctx.fillStyle = `rgba(255, 255, 255, ${flashIntensity})`;
+      ctx.fillRect(0, 0, dimensions.width, dimensions.height);
+      
+      // Draw GOTHIC lettering overlay warning during visual stun
+      ctx.fillStyle = 'rgba(120, 20, 20, 0.8)';
+      ctx.font = 'bold 24px "Space Grotesk", sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText("FLASHLENDİN (KÖR EDİLDİN)", dimensions.width / 2, dimensions.height / 2);
+    }
+
+  }, [targets, config, crosshairPos, dimensions]);
+
+  return (
+    <div 
+      id="game-view-container"
+      ref={containerRef}
+      onMouseMove={handleMouseMove}
+      className="relative w-full h-[540px] bg-neutral-950 border border-neutral-800 rounded-lg overflow-hidden cursor-crosshair select-none"
+    >
+      {/* Background Ambience Layer */}
+      <div className="absolute inset-0 bg-[radial-gradient(ellipse_at_center,_var(--tw-gradient-stops))] from-neutral-900/30 via-neutral-950/90 to-neutral-950 pointer-events-none" />
+      
+      {/* Simulation Interactive canvas */}
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full block" />
+
+      {/* Target Status Floating Card on Hover */}
+      {hoveredTarget && (
+        <div 
+          className="absolute z-30 p-3 bg-neutral-900/95 border border-neutral-700/80 rounded shadow-xl pointer-events-none text-xs text-neutral-300 w-52 font-mono backdrop-blur-md"
+          style={{ 
+            left: `${Math.min((hoveredTarget.x / 100) * dimensions.width + 20, dimensions.width - 230)}px`,
+            top: `${Math.min((hoveredTarget.y / 100) * dimensions.height, dimensions.height - 180)}px`
+          }}
+        >
+          <div className="flex justify-between border-b border-neutral-800 pb-1.5 mb-1.5">
+            <span className="text-neutral-400 font-sans font-bold">HEDEF VERİLERİ</span>
+            <span className={hoveredTarget.team === 'Counter-Terrorist' ? 'text-blue-400' : 'text-red-400'}>
+              {hoveredTarget.team === 'Counter-Terrorist' ? 'CT' : 'T'}
+            </span>
+          </div>
+          <div className="space-y-1">
+            <p className="flex justify-between">
+              <span>İsim:</span> <span className="text-white font-bold">{hoveredTarget.name}</span>
+            </p>
+            <p className="flex justify-between">
+              <span>Sağlık:</span> 
+              <span className={`font-bold ${hoveredTarget.health > 50 ? 'text-green-400' : 'text-red-400'}`}>
+                {hoveredTarget.health}%
+              </span>
+            </p>
+            <p className="flex justify-between">
+              <span>Zırh:</span> <span className="text-blue-400 font-bold">{hoveredTarget.armor}%</span>
+            </p>
+            <p className="flex justify-between">
+              <span>Silah:</span> <span className="text-yellow-400 font-semibold">{hoveredTarget.weapon}</span>
+            </p>
+            <p className="flex justify-between">
+              <span>Mesafe:</span> <span className="text-neutral-200">{hoveredTarget.distance.toFixed(1)}m</span>
+            </p>
+            <p className="flex justify-between">
+              <span>Görünürlük:</span> 
+              <span className={hoveredTarget.spotted ? 'text-orange-400 font-bold' : 'text-neutral-500'}>
+                {hoveredTarget.spotted ? 'GÖRÜNÜR' : 'PASİF'}
+              </span>
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Target Crosshair Centered Reticle */}
+      <div 
+        className="absolute w-6 h-6 -translate-x-1/2 -translate-y-1/2 pointer-events-none transition-all duration-75 mix-blend-difference"
+        style={{ left: `${crosshairPos.x}px`, top: `${crosshairPos.y}px` }}
+      >
+        <div className="absolute top-0 left-1/2 -translate-x-1/2 w-0.5 h-1.5 bg-cyan-400" />
+        <div className="absolute bottom-0 left-1/2 -translate-x-1/2 w-0.5 h-1.5 bg-cyan-400" />
+        <div className="absolute left-0 top-1/2 -translate-y-1/2 w-1.5 h-0.5 bg-cyan-400" />
+        <div className="absolute right-0 top-1/2 -translate-y-1/2 w-1.5 h-0.5 bg-cyan-400" />
+        <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-1 h-1 bg-cyan-400 rounded-full" />
+      </div>
+
+      {/* Outer Corners Design to emphasize high-tech HUD aesthetic */}
+      <div className="absolute top-3 left-3 w-4 h-4 border-t-2 border-l-2 border-neutral-800 pointer-events-none" />
+      <div className="absolute top-3 right-3 w-4 h-4 border-t-2 border-r-2 border-neutral-800 pointer-events-none" />
+      <div className="absolute bottom-3 left-3 w-4 h-4 border-b-2 border-l-2 border-neutral-800 pointer-events-none" />
+      <div className="absolute bottom-3 right-3 w-4 h-4 border-b-2 border-r-2 border-neutral-800 pointer-events-none" />
+
+      {/* Left Bottom Status overlay for cyber gothic telemetry */}
+      <div className="absolute bottom-4 left-4 p-2 bg-black/70 backdrop-blur-sm border border-neutral-800 rounded font-mono text-[9px] text-neutral-400 space-y-0.5 pointer-events-none">
+        <div className="flex items-center gap-1.5 text-neutral-200">
+          <Eye size={10} className="text-purple-400 animate-pulse" />
+          <span className="font-bold">TELEMETRİ PANELİ</span>
+        </div>
+        <p>MATRİS: 1920x1080 (SANAL)</p>
+        <p>KOORDİNAT: X={crosshairPos.x.toFixed(1)}, Y={crosshairPos.y.toFixed(1)}</p>
+        <p>TETİKTEKİ DÜŞMAN SAYISI: {targets.filter(t => t.team === 'Terrorist' && t.spotted).length}</p>
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/components/RadarView.tsx
+================================================================================
+import React from 'react';
+import { Target, HackConfig } from '../types';
+import { BONES } from '../data';
+import { Compass } from 'lucide-react';
+
+interface RadarViewProps {
+  targets: Target[];
+  config: HackConfig;
+  crosshairPos: { x: number; y: number };
+}
+
+export default function RadarView({ targets, config, crosshairPos }: RadarViewProps) {
+  const radarSize = config.radar_size;
+  const scale = config.radar_scale;
+  const center = radarSize / 2;
+
+  // Render simulated radar targets based on coordinate systems
+  return (
+    <div className="flex flex-col items-center bg-neutral-900/90 border border-neutral-800 p-4 rounded-lg relative overflow-hidden backdrop-blur-md">
+      {/* Title */}
+      <div className="w-full flex items-center justify-between mb-3 border-b border-neutral-800 pb-1.5 font-mono text-[11px] text-neutral-400">
+        <span className="flex items-center gap-1.5 font-bold text-neutral-200">
+          <Compass size={12} className="text-purple-400 animate-spin-slow" />
+          AKTİF SİBER RADAR
+        </span>
+        <span>ÖLÇEK: {scale.toFixed(1)}x</span>
+      </div>
+
+      {/* Radar circle wrapper */}
+      <div 
+        className="relative bg-neutral-950 border border-purple-950/50 rounded-full flex items-center justify-center overflow-hidden"
+        style={{ width: `${radarSize}px`, height: `${radarSize}px` }}
+      >
+        {/* Radar concentric circular grid rings */}
+        <div className="absolute inset-0 border border-neutral-900 rounded-full scale-[0.3] pointer-events-none" />
+        <div className="absolute inset-0 border border-neutral-900 rounded-full scale-[0.6] pointer-events-none" />
+        <div className="absolute inset-0 border border-purple-950/20 rounded-full scale-[0.8] pointer-events-none" />
+
+        {/* Dynamic sweeping line effect */}
+        <div className="absolute inset-0 origin-center bg-gradient-to-r from-transparent via-purple-500/5 to-transparent animate-sweep pointer-events-none" />
+
+        {/* Crosshairs axis lines */}
+        <div className="absolute w-full h-[1px] bg-neutral-900/80 pointer-events-none" />
+        <div className="absolute h-full w-[1px] bg-neutral-900/80 pointer-events-none" />
+
+        {/* Local player marker in the dead center */}
+        <div className="absolute z-10 w-2.5 h-2.5 bg-purple-500 rounded-full shadow-[0_0_8px_rgba(168,85,247,0.8)] border border-white flex items-center justify-center">
+          <div className="w-1 h-1 bg-white rounded-full" />
+        </div>
+
+        {/* Relative Radar Targets mapped mathematically */}
+        {targets.map((target) => {
+          // Calculate relative vector from theoretical center point (e.g. coordinates 50, 50)
+          const relX = (target.x - 50) * scale * 2.2;
+          const relY = (target.y - 50) * scale * 2.2;
+
+          // Compute absolute distance from center
+          const dist = Math.sqrt(relX * relX + relY * relY);
+          
+          // Clamp points that fall outside the radar circumference
+          const maxRadius = center - 6;
+          let drawX = relX;
+          let drawY = relY;
+
+          if (dist > maxRadius) {
+            const angle = Math.atan2(relY, relX);
+            drawX = Math.cos(angle) * maxRadius;
+            drawY = Math.sin(angle) * maxRadius;
+          }
+
+          const isTeammate = target.team === 'Counter-Terrorist';
+          
+          let colorClass = 'bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.8)]';
+          if (isTeammate) {
+            colorClass = 'bg-blue-500 shadow-[0_0_6px_rgba(59,130,246,0.8)]';
+          } else if (config.vibe_theme === 'toxin') {
+            colorClass = 'bg-green-500 shadow-[0_0_6px_rgba(34,197,94,0.8)]';
+          } else if (config.vibe_theme === 'obsidian') {
+            colorClass = target.spotted ? 'bg-orange-500 shadow-[0_0_6px_rgba(249,115,22,0.8)]' : 'bg-purple-500 shadow-[0_0_6px_rgba(168,85,247,0.8)]';
+          } else if (config.vibe_theme === 'cyberpunk') {
+            colorClass = 'bg-pink-500 shadow-[0_0_6px_rgba(236,72,153,0.8)]';
+          }
+
+          return (
+            <div
+              key={target.id}
+              className={`absolute w-2 h-2 rounded-full border border-black/80 transition-all duration-300 ${colorClass}`}
+              style={{
+                left: `${center + drawX - 4}px`,
+                top: `${center + drawY - 4}px`,
+              }}
+              title={`${target.name} [${target.team}]`}
+            />
+          );
+        })}
+      </div>
+
+      {/* Footer Info info */}
+      <div className="w-full mt-3 grid grid-cols-2 gap-2 text-[9px] font-mono text-neutral-400">
+        <div className="bg-neutral-950 p-1.5 border border-neutral-800 rounded">
+          <p className="text-neutral-500">HEDEF SAYISI</p>
+          <p className="text-white font-bold">{targets.length}</p>
+        </div>
+        <div className="bg-neutral-950 p-1.5 border border-neutral-800 rounded">
+          <p className="text-neutral-500">LOKAL SEKTÖR</p>
+          <p className="text-purple-400 font-bold">SEKTÖR_09_GB</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/components/BombTimer.tsx
+================================================================================
+import React, { useEffect, useState } from 'react';
+import { HackConfig } from '../types';
+import { Skull, AlertTriangle, ShieldCheck } from 'lucide-react';
+
+interface BombTimerProps {
+  config: HackConfig;
+  onExplode: () => void;
+}
+
+export default function BombTimer({ config, onExplode }: BombTimerProps) {
+  const [isPlanted, setIsPlanted] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(40.0);
+  const [defuseProgress, setDefuseProgress] = useState(0);
+  const [isDefusing, setIsDefusing] = useState(false);
+  const [hasKit, setHasKit] = useState(true);
+
+  // Trigger random plant/defuse cycles for simulator visual play
+  useEffect(() => {
+    let interval: number;
+    let defuseTimeout: number;
+
+    const startSimulationCycle = () => {
+      // Plant the bomb
+      setIsPlanted(true);
+      setTimeLeft(40.0);
+      setDefuseProgress(0);
+      setIsDefusing(false);
+
+      // Defuse trigger after 15 seconds
+      defuseTimeout = window.setTimeout(() => {
+        setIsDefusing(true);
+        const kitState = Math.random() > 0.5;
+        setHasKit(kitState);
+      }, 15000);
+
+      // Countdown loop
+      interval = window.setInterval(() => {
+        setTimeLeft((prev) => {
+          if (prev <= 0.1) {
+            clearInterval(interval);
+            onExplode();
+            // Start next sequence in 10 seconds
+            setTimeout(startSimulationCycle, 10000);
+            return 0;
+          }
+          return Number((prev - 0.1).toFixed(1));
+        });
+
+        // Defusal progression simulation
+        setDefuseProgress((prevDefuse) => {
+          if (!isDefusing) return 0;
+          const increment = hasKit ? 2.5 : 1.25; // 5 seconds vs 10 seconds defusal
+          const nextVal = prevDefuse + increment;
+          if (nextVal >= 100) {
+            setIsDefusing(false);
+            setIsPlanted(false);
+            onExplode(); // triggered finished simulation callback
+            setTimeout(startSimulationCycle, 8000); // loop next
+            return 0;
+          }
+          return nextVal;
+        });
+      }, 100);
+    };
+
+    startSimulationCycle();
+
+    return () => {
+      clearInterval(interval);
+      clearTimeout(defuseTimeout);
+    };
+  }, [isDefusing, hasKit]);
+
+  if (!config.bomb_timer || !isPlanted) return null;
+
+  const progressPercentage = (timeLeft / 40.0) * 100;
+  const isCritical = timeLeft < 10.0;
+
+  return (
+    <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-lg relative overflow-hidden backdrop-blur-md">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-neutral-800 pb-1.5 mb-3 font-mono text-[11px] text-neutral-400">
+        <span className="flex items-center gap-1.5 font-bold text-neutral-200">
+          <Skull size={12} className={isCritical ? 'text-red-500 animate-bounce' : 'text-purple-500'} />
+          C4 PATLAMA DETEKTÖRÜ
+        </span>
+        <span className={`font-extrabold flex items-center gap-1 ${isCritical ? 'text-red-500 animate-pulse' : 'text-yellow-500'}`}>
+          <AlertTriangle size={10} />
+          {isCritical ? 'ACİL_DURUM' : 'BOMBA KURULDU'}
+        </span>
+      </div>
+
+      <div className="space-y-3 font-mono">
+        {/* Main large countdown clock */}
+        <div className="text-center py-2 bg-neutral-950 rounded border border-neutral-800/50">
+          <p className="text-[10px] text-neutral-500 tracking-wider">PATLAMAYA KALAN SÜRE</p>
+          <p className={`text-3xl font-extrabold tracking-widest ${isCritical ? 'text-red-500 animate-pulse' : 'text-yellow-400'}`}>
+            {timeLeft.toFixed(1)}s
+          </p>
+        </div>
+
+        {/* Progress bar representing timeline */}
+        <div className="w-full h-2 bg-neutral-950 rounded overflow-hidden border border-neutral-800">
+          <div 
+            className={`h-full transition-all duration-100 ${isCritical ? 'bg-red-600' : 'bg-purple-600'}`}
+            style={{ width: `${progressPercentage}%` }}
+          />
+        </div>
+
+        {/* Defusal overlay indicator */}
+        {isDefusing && (
+          <div className="bg-neutral-950/90 border border-blue-950/50 p-2 rounded text-[10px]">
+            <div className="flex justify-between items-center text-blue-400 mb-1">
+              <span className="font-bold flex items-center gap-1">
+                <ShieldCheck size={11} className="animate-spin-slow" />
+                BOMBA İMHA EDİLİYOR...
+              </span>
+              <span>{hasKit ? 'İmha Kiti Var (5sn)' : 'İmha Kiti Yok (10sn)'}</span>
+            </div>
+            
+            <div className="w-full h-1.5 bg-neutral-900 rounded overflow-hidden">
+              <div 
+                className="h-full bg-blue-500 transition-all duration-100"
+                style={{ width: `${defuseProgress}%` }}
+              />
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/components/LoggerView.tsx
+================================================================================
+import React from 'react';
+import { TelemetryLog } from '../types';
+import { Skull, ShieldAlert, Terminal, CheckCircle2, RefreshCw } from 'lucide-react';
+
+interface LoggerViewProps {
+  logs: TelemetryLog[];
+  onClear: () => void;
+}
+
+export default function LoggerView({ logs, onClear }: LoggerViewProps) {
+  // Renders real-time telemetry events inside a custom stylized container
+  return (
+    <div className="bg-neutral-900 border border-neutral-800 rounded-lg overflow-hidden flex flex-col h-44 backdrop-blur-md">
+      {/* Title bar */}
+      <div className="bg-neutral-950 px-4 py-2 border-b border-neutral-800 flex items-center justify-between font-mono text-[11px]">
+        <div className="flex items-center gap-1.5 font-bold text-neutral-300">
+          <Terminal size={12} className="text-purple-500 animate-pulse" />
+          SİSTEM TELEMETRİ GÜNLÜĞÜ [GÜVENLİ_BAĞLANTI]
+        </div>
+        <button
+          onClick={onClear}
+          className="text-[9px] text-neutral-500 hover:text-purple-400 font-bold uppercase transition-colors"
+        >
+          LOGLARI TEMİZLE
+        </button>
+      </div>
+
+      {/* Log Feed */}
+      <div className="flex-1 p-3 overflow-y-auto space-y-1.5 bg-neutral-950/60 font-mono text-[10px] select-text">
+        {logs.length === 0 ? (
+          <div className="h-full flex items-center justify-center text-neutral-600 gap-1.5">
+            <RefreshCw size={12} className="animate-spin text-neutral-700" />
+            SİSTEM TELEMETRİ VERİ AKIŞI BEKLENİYOR...
+          </div>
+        ) : (
+          logs.map((log) => {
+            let icon = <Terminal size={11} className="text-neutral-400" />;
+            let textClass = 'text-neutral-300';
+            let label = '[BİLGİ]';
+
+            if (log.type === 'success') {
+              icon = <CheckCircle2 size={11} className="text-green-500" />;
+              textClass = 'text-green-400';
+              label = '[TAMAM]';
+            } else if (log.type === 'warn') {
+              icon = <ShieldAlert size={11} className="text-yellow-500" />;
+              textClass = 'text-yellow-400';
+              label = '[UYARI]';
+            } else if (log.type === 'error' || log.type === 'critical') {
+              icon = <Skull size={11} className="text-red-500" />;
+              textClass = 'text-red-400 font-bold';
+              label = '[KRİT]';
+            }
+
+            return (
+              <div key={log.id} className="flex items-start gap-2 hover:bg-neutral-900/40 p-1 rounded transition-colors">
+                <span className="text-neutral-600 select-none">[{log.timestamp}]</span>
+                <span className="font-bold text-purple-500 select-none">{label}</span>
+                <span className={`flex-1 ${textClass}`}>{log.message}</span>
+                {icon}
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+
+
+// Dosya Yolu: src/components/SpectatorList.tsx
+================================================================================
+import React, { useEffect, useState } from 'react';
+import { Spectator } from '../types';
+import { Radio, Users, Cpu, Shield } from 'lucide-react';
+
+interface SpectatorListProps {
+  spectatorListEnabled: boolean;
+}
+
+export default function SpectatorList({ spectatorListEnabled }: SpectatorListProps) {
+  const [spectators, setSpectators] = useState<Spectator[]>([
+    { id: 1, name: "Kael_Thas", ping: 14, avatar: "💀", status: "watching" },
+    { id: 2, name: "Onyxia_99", ping: 48, avatar: "🐉", status: "idle" },
+    { id: 3, name: "Sargeras", ping: 5, avatar: "🔥", status: "tracking" }
+  ]);
+
+  // Simulate subtle ping fluctuations
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setSpectators((prev) =>
+        prev.map((s) => ({
+          ...s,
+          ping: Math.max(2, Math.min(120, s.ping + Math.floor(Math.random() * 7) - 3))
+        }))
+      );
+    }, 3000);
+    return () => clearInterval(interval);
+  }, []);
+
+  if (!spectatorListEnabled) return null;
+
+  return (
+    <div className="bg-neutral-900 border border-neutral-800 p-4 rounded-lg relative overflow-hidden backdrop-blur-md">
+      <div className="flex items-center justify-between border-b border-neutral-800 pb-1.5 mb-3 font-mono text-[11px] text-neutral-400">
+        <span className="flex items-center gap-1.5 font-bold text-neutral-200">
+          <Users size={12} className="text-purple-400" />
+          İZLEYİCİ RADAR MATRİSİ
+        </span>
+        <span className="flex items-center gap-1 text-red-500 font-bold animate-pulse">
+          <Radio size={10} />
+          AKTİF_İZLEYİCİLER
+        </span>
+      </div>
+
+      <div className="space-y-2">
+        {spectators.map((spec) => (
+          <div 
+            key={spec.id} 
+            className="flex items-center justify-between bg-neutral-950/80 border border-neutral-800/60 p-2 rounded hover:border-purple-950 transition-all duration-200"
+          >
+            <div className="flex items-center gap-2">
+              <span className="text-sm select-none">{spec.avatar}</span>
+              <div className="font-mono text-xs">
+                <p className="text-neutral-200 font-bold">{spec.name}</p>
+                <p className="text-[9px] text-neutral-500 uppercase flex items-center gap-1">
+                  <Shield size={8} className="text-purple-500" />
+                  GECİKME (PING): {spec.ping}ms
+                </p>
+              </div>
+            </div>
+            
+            <span className={`px-1.5 py-0.5 text-[8px] font-mono rounded font-bold uppercase ${
+              spec.status === 'watching' 
+                ? 'bg-purple-900/40 text-purple-300 border border-purple-800/40' 
+                : (spec.status === 'tracking' ? 'bg-red-950/40 text-red-300 border border-red-900/30' : 'bg-neutral-900 text-neutral-500')
+            }`}>
+              {spec.status === 'watching' ? 'İzliyor' : (spec.status === 'tracking' ? 'Takipte' : 'Boşta')}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+================================================================================
+

@@ -1,0 +1,54 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}|CS2_Internal.vcxproj|C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\.github\\upgrades\\CppBuildToolsUpgrade\\assessment.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}",
+      "RelativeMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}|CS2_Internal.vcxproj|solutionrelative:.github\\upgrades\\CppBuildToolsUpgrade\\assessment.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}"
+    },
+    {
+      "AbsoluteMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}|CS2_Internal.vcxproj|C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\.github\\upgrades\\CppBuildToolsUpgrade\\plan.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}",
+      "RelativeMoniker": "D:0:0:{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}|CS2_Internal.vcxproj|solutionrelative:.github\\upgrades\\CppBuildToolsUpgrade\\plan.md||{EFC0BB08-EA7D-40C6-A696-C870411A895B}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 1,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 1,
+              "Title": "plan.md",
+              "DocumentMoniker": "C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\.github\\upgrades\\CppBuildToolsUpgrade\\plan.md",
+              "RelativeDocumentMoniker": ".github\\upgrades\\CppBuildToolsUpgrade\\plan.md",
+              "ToolTip": "C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\.github\\upgrades\\CppBuildToolsUpgrade\\plan.md",
+              "RelativeToolTip": ".github\\upgrades\\CppBuildToolsUpgrade\\plan.md",
+              "ViewState": "AgIAAAAAAAAAAAAAAAAAAD8AAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
+              "WhenOpened": "2026-07-27T15:35:30.817Z",
+              "EditorCaption": ""
+            },
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "assessment.md",
+              "DocumentMoniker": "C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\.github\\upgrades\\CppBuildToolsUpgrade\\assessment.md",
+              "RelativeDocumentMoniker": ".github\\upgrades\\CppBuildToolsUpgrade\\assessment.md",
+              "ToolTip": "C:\\Users\\crazy\\OneDrive\\Masa\u00FCst\u00FC\\Yeni klas\u00F6r (11)\\.github\\upgrades\\CppBuildToolsUpgrade\\assessment.md",
+              "RelativeToolTip": ".github\\upgrades\\CppBuildToolsUpgrade\\assessment.md",
+              "ViewState": "AgIAAAMAAAAAAAAAAAAAABsAAAAAAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.001818|",
+              "WhenOpened": "2026-07-27T15:32:56.658Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

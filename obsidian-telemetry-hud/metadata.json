@@ -1,0 +1,6 @@
+{
+  "name": "Obsidian Telemetry HUD",
+  "description": "An interactive, high-fidelity simulation and visual playground of a dark, gothic cyber-gaming HUD and telemetry control deck.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
